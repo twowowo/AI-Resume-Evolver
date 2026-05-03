@@ -1,0 +1,122 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="false" level="WARNING" enabled_by_default="false">
+      <option name="ignoredPackages">
+        <list>
+          <option value="aiomysql" />
+          <option value="aiosqlite" />
+          <option value="altair" />
+          <option value="anaconda-client" />
+          <option value="anaconda-navigator" />
+          <option value="annotated-doc" />
+          <option value="annotated-types" />
+          <option value="anyio" />
+          <option value="appdirs" />
+          <option value="atomicwrites" />
+          <option value="bkcharts" />
+          <option value="blinker" />
+          <option value="brotlipy" />
+          <option value="cachetools" />
+          <option value="cffi" />
+          <option value="clyent" />
+          <option value="comtypes" />
+          <option value="conda" />
+          <option value="conda-build" />
+          <option value="conda-repo-cli" />
+          <option value="conda-verify" />
+          <option value="constantly" />
+          <option value="cryptography" />
+          <option value="cssselect" />
+          <option value="cytoolz" />
+          <option value="daal4py" />
+          <option value="datashape" />
+          <option value="et-xmlfile" />
+          <option value="exceptiongroup" />
+          <option value="fastapi" />
+          <option value="fonttools" />
+          <option value="gitdb" />
+          <option value="google-ai-generativelanguage" />
+          <option value="google-api-core" />
+          <option value="google-api-python-client" />
+          <option value="google-auth" />
+          <option value="google-auth-httplib2" />
+          <option value="google-genai" />
+          <option value="googleapis-common-protos" />
+          <option value="grpcio" />
+          <option value="grpcio-status" />
+          <option value="h11" />
+          <option value="httpcore" />
+          <option value="httplib2" />
+          <option value="httptools" />
+          <option value="httpx" />
+          <option value="inflection" />
+          <option value="llvmlite" />
+          <option value="mccabe" />
+          <option value="mkl-fft" />
+          <option value="mkl-service" />
+          <option value="mpmath" />
+          <option value="munkres" />
+          <option value="mypy-extensions" />
+          <option value="narwhals" />
+          <option value="navigator-updater" />
+          <option value="numpy" />
+          <option value="openpyxl" />
+          <option value="patsy" />
+          <option value="pep8" />
+          <option value="proto-plus" />
+          <option value="protobuf" />
+          <option value="pyarrow" />
+          <option value="pyasn1-modules" />
+          <option value="pycosat" />
+          <option value="pycurl" />
+          <option value="pydantic" />
+          <option value="pydeck" />
+          <option value="pyls-spyder" />
+          <option value="pyparsing" />
+          <option value="pytest" />
+          <option value="python-dotenv" />
+          <option value="python-lsp-jsonrpc" />
+          <option value="pywin32" />
+          <option value="queuelib" />
+          <option value="rsa" />
+          <option value="scikit-learn-intelex" />
+          <option value="scipy" />
+          <option value="sip" />
+          <option value="smmap" />
+          <option value="starlette" />
+          <option value="statsmodels" />
+          <option value="streamlit" />
+          <option value="tables" />
+          <option value="tenacity" />
+          <option value="typing-inspection" />
+          <option value="uritemplate" />
+          <option value="uvicorn" />
+          <option value="watchfiles" />
+          <option value="webencodings" />
+          <option value="websockets" />
+          <option value="win-unicode-console" />
+          <option value="wincertstore" />
+          <option value="zict" />
+          <option value="backports.weakref" />
+          <option value="GitPython" />
+          <option value="Pillow" />
+          <option value="pydantic_core" />
+          <option value="PyDispatcher" />
+          <option value="PyMySQL" />
+          <option value="PyYAML" />
+          <option value="SQLAlchemy" />
+          <option value="TBB" />
+          <option value="typing_extensions" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyStubPackagesAdvertiser" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="pandas" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
