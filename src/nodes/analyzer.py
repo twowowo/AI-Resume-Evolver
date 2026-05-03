@@ -5,33 +5,46 @@ from src.utils.llm import get_flash_client
 
 JD_ANALYSIS_PROMPT = """你是一个专业资深猎头。请分析以下招聘职位描述（JD），精准提取关键要求，并按以下三类输出：
 
-1. 技术栈：编程语言、框架、工具、数据库等硬技能
-2. 软技能：沟通、逻辑、管理、业务理解等
-3. 加分项：优先条件、加分经验等
+1. tech_stack：编程语言、框架、工具、数据库、云服务等硬技能
+2. soft_skills：沟通、逻辑、管理、业务理解、领导力等软技能
+3. business_scene：行业领域、业务场景、项目类型等
 
 请严格以 JSON 格式返回，不要包含任何多余的解释：
-{"技术栈": ["关键词1", "关键词2", ...], "软技能": ["关键词1", ...], "加分项": ["关键词1", ...]}
+{"tech_stack": ["关键词1", "关键词2", ...], "soft_skills": ["关键词1", ...], "business_scene": ["关键词1", ...]}
 
 JD 内容：
 {jd_text}"""
 
 
-def _parse_ai_response(response_text: str) -> list[str]:
+def _parse_ai_response(response_text: str) -> dict[str, list[str]]:
     json_match = re.search(r"\{[\s\S]*\}", response_text)
     if not json_match:
         print("[analyzer] AI 返回格式异常，尝试按行解析")
-        return [line.strip("- ").strip() for line in response_text.split("\n") if line.strip()]
+        lines = [line.strip("- ").strip() for line in response_text.split("\n") if line.strip()]
+        return {"tech_stack": lines, "soft_skills": [], "business_scene": []}
 
     try:
         data = json.loads(json_match.group(0))
     except json.JSONDecodeError:
         print("[analyzer] JSON 解析失败，回退到按行解析")
-        return [line.strip("- ").strip() for line in response_text.split("\n") if line.strip()]
+        lines = [line.strip("- ").strip() for line in response_text.split("\n") if line.strip()]
+        return {"tech_stack": lines, "soft_skills": [], "business_scene": []}
 
+    result = {
+        "tech_stack": [],
+        "soft_skills": [],
+        "business_scene": [],
+    }
+    for key in result:
+        if key in data and isinstance(data[key], list):
+            result[key] = data[key]
+    return result
+
+
+def _flatten_keywords(structured: dict[str, list[str]]) -> list[str]:
     keywords = []
-    for category, items in data.items():
-        if isinstance(items, list):
-            keywords.extend(items)
+    for items in structured.values():
+        keywords.extend(items)
     return keywords
 
 
@@ -41,26 +54,29 @@ def _enrich_with_rag(keywords: list[str]) -> list[str]:
 
         retriever = get_retriever()
         enriched = list(keywords)
+        seen = set(keywords)
 
         for kw in keywords[:5]:
             try:
                 docs = retriever.invoke(kw)
                 for doc in docs:
                     term = doc.page_content.strip()
-                    if term and term not in enriched:
+                    if term and term not in seen:
+                        seen.add(term)
                         enriched.append(term)
-            except Exception:
-                pass
+            except Exception as inner_e:
+                print(f"[analyzer] 关键词 '{kw}' 检索跳过: {inner_e}")
 
-        if len(enriched) > len(keywords):
-            print(f"[analyzer] RAG 补充了 {len(enriched) - len(keywords)} 个行业术语")
+        added = len(enriched) - len(keywords)
+        if added > 0:
+            print(f"[analyzer] RAG 补充了 {added} 个行业术语")
 
         return enriched
     except ImportError:
         print("[analyzer] vector_store 模块未就绪，跳过 RAG 增强")
         return keywords
     except Exception as e:
-        print(f"[analyzer] RAG 检索失败 ({e})，使用原始关键词")
+        print(f"[analyzer] RAG 检索失败 ({type(e).__name__}: {e})，使用原始关键词")
         return keywords
 
 
@@ -79,10 +95,18 @@ def jd_analyzer_node(state: GraphState) -> GraphState:
         response = llm.invoke(prompt)
         response_text = response.content if hasattr(response, "content") else str(response)
 
-        print(f"[analyzer] AI 原始返回:\n{response_text[:300]}...")
+        print(f"[analyzer] AI 原始返回:\n{response_text[:400]}...")
 
-        keywords = _parse_ai_response(response_text)
-        print(f"[analyzer] 提取到 {len(keywords)} 个关键词: {keywords}")
+        structured = _parse_ai_response(response_text)
+        print(
+            f"[analyzer] 结构化提取: "
+            f"tech_stack={len(structured['tech_stack'])}项, "
+            f"soft_skills={len(structured['soft_skills'])}项, "
+            f"business_scene={len(structured['business_scene'])}项"
+        )
+
+        keywords = _flatten_keywords(structured)
+        print(f"[analyzer] 合并关键词 ({len(keywords)} 项): {keywords}")
 
         keywords = _enrich_with_rag(keywords)
 

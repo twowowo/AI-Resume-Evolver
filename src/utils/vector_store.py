@@ -1,12 +1,33 @@
 import os
+import chromadb
+from chromadb.config import Settings
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain_community.document_compressors.flashrank_rerank import FlashrankRerank
 
-VECTOR_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "vector_db")
-VECTOR_DB_PATH = os.path.abspath(VECTOR_DB_PATH)
+COLLECTION_NAME = "resume_evolution_v1"
 
 _embedding_model = None
 _vector_store = None
+_enhanced_retriever = None
+
+
+def _get_env_or_raise(key: str, hint: str = "") -> str:
+    value = os.getenv(key)
+    if not value:
+        msg = f"环境变量 {key} 未设置"
+        if hint:
+            msg += f"，提示：{hint}"
+        raise ValueError(msg)
+    return value
+
+
+def _get_chroma_config():
+    host = os.getenv("CHROMA_SERVER_HOST", "localhost")
+    port = int(os.getenv("CHROMA_SERVER_PORT", "8001"))
+    return host, port
 
 
 def _get_embedding_model() -> HuggingFaceEmbeddings:
@@ -21,20 +42,73 @@ def _get_embedding_model() -> HuggingFaceEmbeddings:
 def get_vector_store() -> Chroma:
     global _vector_store
     if _vector_store is None:
-        os.makedirs(VECTOR_DB_PATH, exist_ok=True)
-        _vector_store = Chroma(
-            collection_name="industry_terms",
-            embedding_function=_get_embedding_model(),
-            persist_directory=VECTOR_DB_PATH,
+        host, port = _get_chroma_config()
+        print(f"[vector_store] 连接 ChromaDB Docker: {host}:{port}")
+
+        http_client = chromadb.HttpClient(
+            host=host,
+            port=port,
+            settings=Settings(anonymized_telemetry=False),
         )
+
+        _vector_store = Chroma(
+            client=http_client,
+            collection_name=COLLECTION_NAME,
+            embedding_function=_get_embedding_model(),
+        )
+        print(f"[vector_store] Collection '{COLLECTION_NAME}' 已就绪")
     return _vector_store
 
 
-def get_retriever():
+def _build_base_retriever():
     store = get_vector_store()
-    return store.as_retriever(search_kwargs={"k": 5})
+    return store.as_retriever(search_kwargs={"k": 10})
+
+
+def _build_multi_query_retriever():
+    from src.utils.llm import get_flash_client
+
+    base_retriever = _build_base_retriever()
+    llm = get_flash_client()
+
+    mq_retriever = MultiQueryRetriever.from_llm(
+        retriever=base_retriever,
+        llm=llm,
+        include_original=True,
+    )
+    print("[vector_store] MultiQueryRetriever 已装配 (扩写 3 个查询变体)")
+    return mq_retriever
+
+
+def _build_reranker():
+    return FlashrankRerank(
+        model="ms-marco-MiniLM-L-6-v2",
+        top_n=3,
+    )
+
+
+def get_retriever():
+    global _enhanced_retriever
+    if _enhanced_retriever is None:
+        try:
+            mq_retriever = _build_multi_query_retriever()
+            reranker = _build_reranker()
+
+            _enhanced_retriever = ContextualCompressionRetriever(
+                base_compressor=reranker,
+                base_retriever=mq_retriever,
+            )
+            print("[vector_store] RAG 管线就绪: MultiQuery → Top-10 粗筛 → Reranker → Top-3 精排")
+        except Exception as e:
+            print(f"[vector_store] 增强管线构建失败 ({e})，回退到基础检索器")
+            _enhanced_retriever = _build_base_retriever()
+
+    return _enhanced_retriever
 
 
 def add_terms(terms: list[str]):
+    if not terms:
+        return
     store = get_vector_store()
     store.add_texts(terms)
+    print(f"[vector_store] 已写入 {len(terms)} 条术语到 '{COLLECTION_NAME}'")
