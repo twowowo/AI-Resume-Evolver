@@ -1,11 +1,16 @@
 import os
 import chromadb
 from chromadb.config import Settings
+from chromadb.utils import embedding_functions
 from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.retrievers.multi_query import MultiQueryRetriever
-from langchain.retrievers import ContextualCompressionRetriever
+from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+from langchain_classic.retrievers import ContextualCompressionRetriever
 from langchain_community.document_compressors.flashrank_rerank import FlashrankRerank
+
+try:
+    FlashrankRerank.model_rebuild()
+except Exception:
+    pass
 
 COLLECTION_NAME = "resume_evolution_v1"
 
@@ -14,28 +19,26 @@ _vector_store = None
 _enhanced_retriever = None
 
 
-def _get_env_or_raise(key: str, hint: str = "") -> str:
-    value = os.getenv(key)
-    if not value:
-        msg = f"环境变量 {key} 未设置"
-        if hint:
-            msg += f"，提示：{hint}"
-        raise ValueError(msg)
-    return value
-
-
 def _get_chroma_config():
     host = os.getenv("CHROMA_SERVER_HOST", "localhost")
     port = int(os.getenv("CHROMA_SERVER_PORT", "8001"))
     return host, port
 
 
-def _get_embedding_model() -> HuggingFaceEmbeddings:
+def _get_embedding_model():
     global _embedding_model
     if _embedding_model is None:
-        _embedding_model = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
+        _chroma_ef = embedding_functions.DefaultEmbeddingFunction()
+
+        class _ChromaEmbeddingWrapper:
+            def embed_documents(self, texts):
+                return _chroma_ef(texts)
+
+            def embed_query(self, text):
+                return _chroma_ef([text])[0]
+
+        _embedding_model = _ChromaEmbeddingWrapper()
+        print("[vector_store] ONNX Embedding (all-MiniLM-L6-v2, 384d) 已就绪")
     return _embedding_model
 
 
@@ -81,10 +84,16 @@ def _build_multi_query_retriever():
 
 
 def _build_reranker():
-    return FlashrankRerank(
-        model="ms-marco-MiniLM-L-6-v2",
-        top_n=3,
-    )
+    try:
+        reranker = FlashrankRerank(
+            model="ms-marco-MiniLM-L-6-v2",
+            top_n=3,
+        )
+        print("[vector_store] FlashrankRerank 已就绪")
+        return reranker
+    except Exception as e:
+        print(f"[vector_store] FlashrankRerank 初始化失败 ({e})，降级为无重排模式")
+        return None
 
 
 def get_retriever():
@@ -94,11 +103,15 @@ def get_retriever():
             mq_retriever = _build_multi_query_retriever()
             reranker = _build_reranker()
 
-            _enhanced_retriever = ContextualCompressionRetriever(
-                base_compressor=reranker,
-                base_retriever=mq_retriever,
-            )
-            print("[vector_store] RAG 管线就绪: MultiQuery → Top-10 粗筛 → Reranker → Top-3 精排")
+            if reranker is not None:
+                _enhanced_retriever = ContextualCompressionRetriever(
+                    base_compressor=reranker,
+                    base_retriever=mq_retriever,
+                )
+                print("[vector_store] RAG 管线就绪: MultiQuery -> Top-10 粗筛 -> Reranker -> Top-3 精排")
+            else:
+                _enhanced_retriever = mq_retriever
+                print("[vector_store] RAG 管线就绪: MultiQuery -> Top-10 粗筛 (无重排)")
         except Exception as e:
             print(f"[vector_store] 增强管线构建失败 ({e})，回退到基础检索器")
             _enhanced_retriever = _build_base_retriever()
