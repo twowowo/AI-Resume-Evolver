@@ -1,0 +1,15 @@
+[数据科学/分析领域]
+- 数据清洗规范：使用 Pandas 进行向量化操作，处理空值(fillna/dropna)、去重(drop_duplicates)及异常值(Z-Score/IQR检测)。
+- 特征工程：One-Hot Encoding、特征缩放(StandardScaler)、特征交叉、维度削减(PCA)。
+- 统计学核心：假设检验(T-test/Z-test)、P-value 显著性判断、置信区间计算、样本量计算(Power Analysis)。
+- A/B Testing：流量分桶(Hashing/Randomization)、AA实验(验证分流均匀性)、指标体系(北极星指标、护栏指标)。
+- 可视化标准：使用 Plotly/Echarts 实现交互式看板，核心在于归因分析而非数据堆砌。
+
+[后端与工程领域]
+- FastAPI 高阶：异步编程(async/await)、依赖注入系统(Depends)、OAuth2 安全认证、Middleware 拦截器。
+- 数据库优化：B-Tree 索引优化、EXPLAIN 分析慢查询、读写分离架构、Redis 缓存预热。
+- 自动化：CI/CD 流水线配置、Docker 容器化部署、单元测试覆盖率(Pytest)。
+
+[大模型 RAG 领域]
+- 核心链条：文档切片(Chunking)、向量嵌入(Embedding)、余弦相似度检索、Prompt 注入增强。
+- 优化手段：多路召回(Multi-query)、重排序(Rerank)、上下文压缩。
