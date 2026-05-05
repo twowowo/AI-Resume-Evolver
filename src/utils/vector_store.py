@@ -4,13 +4,6 @@ from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 from langchain_chroma import Chroma
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
-from langchain_classic.retrievers import ContextualCompressionRetriever
-from langchain_community.document_compressors.flashrank_rerank import FlashrankRerank
-
-try:
-    FlashrankRerank.model_rebuild()
-except Exception:
-    pass
 
 COLLECTION_NAME = "resume_evolution_v1"
 
@@ -83,37 +76,14 @@ def _build_multi_query_retriever():
     return mq_retriever
 
 
-def _build_reranker():
-    try:
-        reranker = FlashrankRerank(
-            model="ms-marco-MiniLM-L-6-v2",
-            top_n=3,
-        )
-        print("[vector_store] FlashrankRerank 已就绪")
-        return reranker
-    except Exception as e:
-        print(f"[vector_store] FlashrankRerank 初始化失败 ({e})，降级为无重排模式")
-        return None
-
-
 def get_retriever():
     global _enhanced_retriever
     if _enhanced_retriever is None:
         try:
-            mq_retriever = _build_multi_query_retriever()
-            reranker = _build_reranker()
-
-            if reranker is not None:
-                _enhanced_retriever = ContextualCompressionRetriever(
-                    base_compressor=reranker,
-                    base_retriever=mq_retriever,
-                )
-                print("[vector_store] RAG 管线就绪: MultiQuery -> Top-10 粗筛 -> Reranker -> Top-3 精排")
-            else:
-                _enhanced_retriever = mq_retriever
-                print("[vector_store] RAG 管线就绪: MultiQuery -> Top-10 粗筛 (无重排)")
+            _enhanced_retriever = _build_multi_query_retriever()
+            print("[vector_store] RAG 管线就绪: MultiQuery -> Top-10 粗筛 (k=10, 无 Rerank)")
         except Exception as e:
-            print(f"[vector_store] 增强管线构建失败 ({e})，回退到基础检索器")
+            print(f"[vector_store] MultiQuery 构建失败 ({e})，回退到基础检索器")
             _enhanced_retriever = _build_base_retriever()
 
     return _enhanced_retriever

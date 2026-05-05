@@ -4,18 +4,24 @@ from src.state import GraphState
 from src.utils.llm import get_flash_client
 
 _PLACEHOLDER_PATTERN = re.compile(r"^\[.+?\]$")
+_BRACKET_PATTERN = re.compile(r"[\[\]]")
 
 
 def _is_placeholder(text: str) -> bool:
-    return bool(_PLACEHOLDER_PATTERN.match(text.strip()))
+    t = text.strip()
+    if not t:
+        return True
+    if _BRACKET_PATTERN.search(t):
+        return True
+    if _PLACEHOLDER_PATTERN.match(t):
+        return True
+    return False
 
 
 def _filter_rag_results(docs: list) -> list:
     filtered = []
     for doc in docs:
         term = doc.page_content.strip()
-        if not term:
-            continue
         if _is_placeholder(term):
             continue
         filtered.append(doc)
