@@ -88,6 +88,8 @@ def main():
         raw_resume=raw_resume,
         target_jd=target_jd,
         gap_list=[],
+        rich_context_list=[],
+        rag_context="",
         refined_resume="",
         feedback="",
         revision_count=0,

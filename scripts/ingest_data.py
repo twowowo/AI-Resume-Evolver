@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import glob
 
@@ -25,9 +26,22 @@ def log(msg):
         f.flush()
 
 
-def _clean_text(raw: str) -> list[str]:
+_BRACKET_LABEL = re.compile(r"^\s*\[(.+?)\]\s*")
+
+
+def _strip_bracket_label(line: str) -> tuple[str, str]:
+    m = _BRACKET_LABEL.match(line)
+    if m:
+        label = m.group(1).strip()
+        content = line[m.end():].strip()
+        return label, content
+    return "", line
+
+
+def _clean_text(raw: str) -> tuple[list[str], list[dict]]:
     paragraphs = raw.split("\n\n")
-    terms = []
+    terms: list[str] = []
+    metadatas: list[dict] = []
 
     for para in paragraphs:
         para = para.strip()
@@ -40,13 +54,26 @@ def _clean_text(raw: str) -> list[str]:
             if not line:
                 continue
 
-            cleaned = line.lstrip("-•·*#0123456789.。、)）】〗>»› ")
-            cleaned = cleaned.strip()
+            stripped = line.lstrip("-•·*#0123456789.。、)）】〗>»› ")
+            stripped = stripped.strip()
 
-            if len(cleaned) >= MIN_TERM_LENGTH:
-                terms.append(cleaned)
+            if not stripped:
+                continue
 
-    return terms
+            label, content = _strip_bracket_label(stripped)
+
+            if not content:
+                continue
+
+            if len(content) >= MIN_TERM_LENGTH:
+                terms.append(content)
+                meta = {}
+                if label:
+                    meta["tag"] = label
+                meta["source_line"] = stripped[:80]
+                metadatas.append(meta)
+
+    return terms, metadatas
 
 
 def _load_file(file_path: str) -> str:
@@ -73,7 +100,8 @@ def run():
         return
 
     log(f"[ingest] 发现 {len(all_files)} 个文件待处理")
-    all_terms = []
+    all_terms: list[str] = []
+    all_metadatas: list[dict] = []
 
     for file_path in all_files:
         file_name = os.path.basename(file_path)
@@ -84,17 +112,23 @@ def run():
             log(f"[ingest] 跳过空文件: {file_name}")
             continue
 
-        terms = _clean_text(raw_text)
+        terms, metadatas = _clean_text(raw_text)
         log(f"[ingest]   -> 清洗后得到 {len(terms)} 条有效术语")
         all_terms.extend(terms)
+        all_metadatas.extend(metadatas)
 
     if not all_terms:
         log("[ingest] 没有有效术语可写入")
         return
 
-    log(f"[ingest] 共 {len(all_terms)} 条术语，开始写入 ChromaDB ...")
-    add_terms(all_terms)
-    log(f"[ingest] 灌注完成！成功存入 {len(all_terms)} 条术语到 resume_evolution_v1")
+    tagged = sum(1 for m in all_metadatas if m.get("tag"))
+    log(f"[ingest] 共 {len(all_terms)} 条术语 (其中 {tagged} 条含分类标签)，开始写入 ChromaDB ...")
+    add_terms(all_terms, metadatas=all_metadatas)
+    log(f"[ingest] 灌注完成！成功存入 {len(all_terms)} 条术语到 {os.path.basename(REFERENCE_DIR)}")
+
+    from src.utils.vector_store import rebuild_bm25
+    rebuild_bm25()
+    log("[ingest] BM25 索引已重建")
 
 
 if __name__ == "__main__":

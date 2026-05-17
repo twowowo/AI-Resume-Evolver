@@ -3,19 +3,31 @@ import re
 from src.state import GraphState
 from src.utils.llm import get_flash_client
 
-_PLACEHOLDER_PATTERN = re.compile(r"^\[.+?\]$")
-_BRACKET_PATTERN = re.compile(r"[\[\]]")
+_PLACEHOLDER_PATTERN = re.compile(r"^\s*\[.+?\]\s*$")
+_SECTION_HEADER = re.compile(r"^\s*[一二三四五六七八九十]、|\(Architecture|\(Backend|\(Frontend|\(DevOps|\(Data|\(AI")
+_BRACKET_LABEL_ONLY = re.compile(r"^\s*\[.+?\]\s*$")
 
 
 def _is_placeholder(text: str) -> bool:
     t = text.strip()
     if not t:
         return True
-    if _BRACKET_PATTERN.search(t):
-        return True
     if _PLACEHOLDER_PATTERN.match(t):
         return True
+    if _BRACKET_LABEL_ONLY.match(t):
+        return True
     return False
+
+
+def _is_quality_context(text: str) -> bool:
+    t = text.strip()
+    if not t or len(t) < 12:
+        return False
+    if _is_placeholder(t):
+        return False
+    if _SECTION_HEADER.search(t):
+        return False
+    return True
 
 
 def _filter_rag_results(docs: list) -> list:
@@ -41,7 +53,6 @@ JD 内容：
 
 
 def _parse_ai_response(response_text: str) -> dict[str, list[str]]:
-    # 尝试多种 JSON 提取方式
     json_match = re.search(r"\{[\s\S]*?\}", response_text)
     if not json_match:
         print("[analyzer] AI 返回格式异常，尝试按行解析")
@@ -49,18 +60,13 @@ def _parse_ai_response(response_text: str) -> dict[str, list[str]]:
         return {"tech_stack": lines, "soft_skills": [], "business_scene": []}
 
     json_str = json_match.group(0)
-    
-    # 清理可能的额外引号或格式问题
     json_str = json_str.replace("'\"", "'").replace('"\'', '"')
     
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError as e:
         print(f"[analyzer] JSON 解析失败: {e}，尝试修复格式")
-        
-        # 尝试修复常见的 JSON 格式问题
         try:
-            # 处理可能的单引号问题
             json_str_fixed = json_str.replace("'", '"')
             data = json.loads(json_str_fixed)
         except json.JSONDecodeError:
@@ -73,14 +79,9 @@ def _parse_ai_response(response_text: str) -> dict[str, list[str]]:
         "soft_skills": [],
         "business_scene": [],
     }
-    
-    # 更健壮的键处理
     for key in result:
         if key in data and isinstance(data[key], list):
             result[key] = data[key]
-        elif f'"{key}"' in json_str:  # 检查是否有带引号的键
-            print(f"[analyzer] 检测到带引号的键 '{key}'，跳过处理")
-    
     return result
 
 
@@ -91,37 +92,52 @@ def _flatten_keywords(structured: dict[str, list[str]]) -> list[str]:
     return keywords
 
 
-def _enrich_with_rag(keywords: list[str]) -> list[str]:
+def _enrich_with_rag(keywords: list[str]) -> tuple[list[str], list[str], str]:
+    rich_context: list[str] = []
+    rag_context_text = ""
     try:
-        from src.utils.vector_store import get_retriever
+        from src.utils.vector_store import hybrid_retrieve, rebuild_bm25
 
-        retriever = get_retriever()
+        rebuild_bm25()
+
         enriched = list(keywords)
         seen = set(keywords)
+        all_full_context: list[str] = []
 
         for kw in keywords[:5]:
             try:
-                docs = retriever.invoke(kw)
+                docs = hybrid_retrieve(kw, vector_k=10, bm25_k=10, fusion_k=5)
                 docs = _filter_rag_results(docs)
                 for doc in docs:
-                    term = doc.page_content.strip()
-                    if term and term not in seen:
-                        seen.add(term)
-                        enriched.append(term)
+                    content = doc.page_content.strip()
+                    if content and len(content) > 6:
+                        if _is_quality_context(content) and content not in seen:
+                            seen.add(content)
+                            all_full_context.append(content)
+                        term = content[:60] if len(content) > 60 else content
+                        if term not in seen:
+                            seen.add(term)
+                            enriched.append(term)
             except Exception as inner_e:
-                print(f"[analyzer] 关键词 '{kw}' 检索跳过: {inner_e}")
+                print(f"[analyzer] 混合检索关键词 '{kw}' 跳过: {inner_e}")
 
         added = len(enriched) - len(keywords)
         if added > 0:
             print(f"[analyzer] RAG 补充了 {added} 个行业术语")
 
-        return enriched
+        top_context = all_full_context[:3]
+        if top_context:
+            rich_context = top_context
+            rag_context_text = "\n".join(f"{i}. {c}" for i, c in enumerate(top_context, 1))
+            print(f"[analyzer] Top-3 金牌案例已注入 rag_context ({len(rag_context_text)} 字符)")
+
+        return enriched, rich_context, rag_context_text
     except ImportError:
         print("[analyzer] vector_store 模块未就绪，跳过 RAG 增强")
-        return keywords
+        return keywords, rich_context, rag_context_text
     except Exception as e:
         print(f"[analyzer] RAG 检索失败 ({type(e).__name__}: {e})，使用原始关键词")
-        return keywords
+        return keywords, rich_context, rag_context_text
 
 
 def jd_analyzer_node(state: GraphState) -> GraphState:
@@ -131,18 +147,18 @@ def jd_analyzer_node(state: GraphState) -> GraphState:
     if not jd_text.strip():
         print("[analyzer] 警告：target_jd 为空，跳过分析")
         state["gap_list"] = []
+        state["rich_context_list"] = []
+        state["rag_context"] = ""
         return state
 
     try:
         llm = get_flash_client()
-        # 使用字符串替换而不是 format()，避免 JSON 键被误解析
         prompt = JD_ANALYSIS_PROMPT.replace("{jd_content}", jd_text)
         response = llm.invoke(prompt)
         response_text = response.content if hasattr(response, "content") else str(response)
 
         print(f"[analyzer] AI 原始返回:\n{response_text[:800]}...")
         
-        # 调试：打印完整的 JSON 部分
         json_match = re.search(r"\{[\s\S]*?\}", response_text)
         if json_match:
             print(f"[analyzer] 提取的 JSON 部分: {json_match.group(0)}")
@@ -158,19 +174,27 @@ def jd_analyzer_node(state: GraphState) -> GraphState:
         keywords = _flatten_keywords(structured)
         print(f"[analyzer] 合并关键词 ({len(keywords)} 项): {keywords}")
 
-        keywords = _enrich_with_rag(keywords)
+        keywords, rich_context, rag_context_text = _enrich_with_rag(keywords)
 
         state["gap_list"] = keywords
-        print(f"[analyzer] 最终 gap_list ({len(keywords)} 项): {keywords}")
+        state["rich_context_list"] = rich_context
+        state["rag_context"] = rag_context_text
+        print(f"[analyzer] 最终 gap_list ({len(keywords)} 项), rich_context ({len(rich_context)} 条)")
 
     except ValueError as e:
         print(f"[analyzer] 配置错误: {e}")
         state["gap_list"] = []
+        state["rich_context_list"] = []
+        state["rag_context"] = ""
     except Exception as e:
         print(f"[analyzer] AI 调用失败 ({type(e).__name__}: {e})，保留原始状态")
         import traceback
         traceback.print_exc()
         if not state.get("gap_list"):
             state["gap_list"] = []
+        if not state.get("rich_context_list"):
+            state["rich_context_list"] = []
+        if not state.get("rag_context"):
+            state["rag_context"] = ""
 
     return state

@@ -23,6 +23,13 @@ REFINER_SYSTEM_PROMPT = """你是一位顶级互联网公司（如字节跳动�
 
 6. 输出格式：直接输出优化后的完整简历内容。简历应包含：个人信息、个人优势/自我评价、工作经历（含项目描述）、教育背景。
 
+【金牌案例素材】以下是从企业内部知识库中检索到的真实技术方案和量化指标案例。你必须仔细阅读并参考这些素材：
+- 将素材中的具体量化数字（如"延迟从 12s 降至 0.8s"、"QPS 提升 40%"）应用到用户相应的技术描述中
+- 将素材中的技术方案（如"异步非阻塞模型"、"B-Tree 联合索引"、"布隆过滤器"）深度融入用户的同类项目经历
+- 禁止只看关键词不看上下文：素材是完整的技术段落，不是孤立的词汇列表
+
+{golden_cases}
+
 目标 JD 要求：
 {target_jd}
 
@@ -64,10 +71,25 @@ def _build_gap_terms_text(gap_list: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _build_golden_cases_text(rich_context_list: list[str]) -> str:
+    if not rich_context_list:
+        return "（暂无金牌案例素材，请基于通用大厂标准进行技术深度延伸）"
+
+    max_cases = 10
+    cases = rich_context_list[:max_cases]
+
+    lines = []
+    for i, case in enumerate(cases, 1):
+        lines.append(f"案例{i}. {case}")
+    return "\n".join(lines)
+
+
 def resume_refiner_node(state: GraphState) -> GraphState:
     raw_resume = state.get("raw_resume", "")
     target_jd = state.get("target_jd", "")
     gap_list = state.get("gap_list", [])
+    rich_context_list = state.get("rich_context_list", [])
+    rag_context = state.get("rag_context", "")
 
     if not raw_resume.strip():
         print("[refiner] 警告：raw_resume 为空，跳过优化")
@@ -75,9 +97,11 @@ def resume_refiner_node(state: GraphState) -> GraphState:
         return state
 
     gap_terms_text = _build_gap_terms_text(gap_list)
+    golden_cases_text = rag_context if rag_context else _build_golden_cases_text(rich_context_list)
 
     prompt = REFINER_SYSTEM_PROMPT.format(
         gap_terms=gap_terms_text,
+        golden_cases=golden_cases_text,
         target_jd=target_jd,
         raw_resume=raw_resume,
     )
@@ -86,7 +110,9 @@ def resume_refiner_node(state: GraphState) -> GraphState:
     model_label = "DeepSeek-V4-Pro (Thinking)" if use_pro else "DeepSeek-V4-Flash"
 
     print(f"[refiner] 开始调用 {model_label}...")
-    print(f"[refiner] Prompt 长度: {len(prompt)} 字符, gap_list 有效术语: {gap_terms_text.count(chr(10))} 条")
+    print(f"[refiner] Prompt 长度: {len(prompt)} 字符")
+    print(f"[refiner] gap_list 术语: {gap_terms_text.count(chr(10)) + (1 if gap_terms_text else 0)} 条")
+    print(f"[refiner] 金牌案例素材: {golden_cases_text.count('案例')} 条")
 
     try:
         if use_pro:
