@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .DS_Store
 vector_db/
+output/
+data/resumes/~$*
+*.txt
+!data/reference/*.txt
