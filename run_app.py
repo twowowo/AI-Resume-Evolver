@@ -10,9 +10,11 @@ env_path = os.path.join(os.path.dirname(__file__) or ".", ".env")
 load_dotenv(dotenv_path=env_path)
 
 NODE_DISPLAY = {
-    "retriever": "检索中...    (从 352 条金牌案例库匹配)",
+    "retriever": "检索中...    (从金牌案例库匹配)",
     "tavily_search": "搜索中...    (联网获取企业/技术最新信息)",
-    "editor": "重构中...    (DeepSeek 优化简历)",
+    "editor": "重构中...    (DeepSeek 粗优化简历)",
+    "evaluator": "评审中...    (三维评分: JD匹配/STAR/动词)",
+    "polisher": "精修中...    (DeepSeek-V4-Pro Thinking 靶向修改)",
 }
 
 
@@ -135,6 +137,9 @@ def main():
         "revised_resume": "",
         "internal_monologue": "",
         "tool_outputs": [],
+        "score": 0,
+        "evaluation_feedback": "",
+        "iteration_count": 0,
     }
 
     seen_nodes = set()
@@ -155,6 +160,16 @@ def main():
     final = app.invoke(initial)
 
     print(f"\n  [TIME] 全链路耗时: {elapsed:.1f} 秒")
+
+    # v2.0-alpha: 显示评分
+    score = final.get("score", 0)
+    eval_fb = final.get("evaluation_feedback", "")
+    iteration = final.get("iteration_count", 0)
+    print(f"\n  [SCORE] 最终评分: {score}/100 (共 {iteration} 轮迭代)")
+    if score < 70:
+        print(f"  [WARN] 评分未达 70 分阈值，已达最大迭代次数")
+    if eval_fb and len(eval_fb) < 500:
+        print(f"  [FEEDBACK] {eval_fb}")
 
     monologue = final.get("internal_monologue", "")
 
