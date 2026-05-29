@@ -166,16 +166,36 @@ def evaluator_node(state: AgentState):
               f"(JD匹配: {dims.get('jd_match', '?')}/40, "
               f"STAR: {dims.get('star_completion', '?')}/30, "
               f"动词: {dims.get('verb_quality', '?')}/30) "
-              f"{'✓ 通过' if passed else '✗ 需修改'}")
+              f"{'[PASS] 通过' if passed else '[FAIL] 需修改'}")
 
         if not passed and result.get("feedback"):
             feedback_preview = result["feedback"][:300]
             print(f"[evaluator] 反馈摘要: {feedback_preview}...")
 
+        # v2.1 分诊熔断：保留 pre_evaluator 设置的 flag，仅作安全网补充
+        existing_flag = state.get("difficulty_flag", "")
+        difficulty_flag = existing_flag  # 不覆盖 pre_evaluator 的判定
+        node_status = ""
+
+        if existing_flag != "EXTREME_GAP" and score < 30 and iteration_count == 0:
+            difficulty_flag = "EXTREME_GAP"
+            node_status = "检测到优化后简历与目标JD差距仍过大，已启动硬核单轮重组方案..."
+            print(f"[evaluator] 安全网熔断触发: score={score} < 30 (CRITICAL_LOW)，"
+                  f"标记 difficulty_flag=EXTREME_GAP")
+
+        # 规范化 feedback：确保始终为字符串
+        feedback = result.get("feedback", "")
+        if isinstance(feedback, list):
+            feedback = "\n".join(feedback)
+        elif not isinstance(feedback, str):
+            feedback = str(feedback)
+
         return {
             "score": score,
-            "evaluation_feedback": result.get("feedback", ""),
+            "evaluation_feedback": feedback,
             "iteration_count": iteration_count,
+            "difficulty_flag": difficulty_flag,
+            "node_status": node_status,
         }
 
     except Exception as e:

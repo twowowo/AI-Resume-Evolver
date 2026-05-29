@@ -12,7 +12,8 @@ load_dotenv(dotenv_path=env_path)
 NODE_DISPLAY = {
     "retriever": "检索中...    (从金牌案例库匹配)",
     "tavily_search": "搜索中...    (联网获取企业/技术最新信息)",
-    "editor": "重构中...    (DeepSeek 粗优化简历)",
+    "pre_evaluator": "分诊中...    (原始简历前置评分, 三路分诊)",
+    "editor": "重构中...    (DeepSeek 优化简历 / 防幻觉骨架)",
     "evaluator": "评审中...    (三维评分: JD匹配/STAR/动词)",
     "polisher": "精修中...    (DeepSeek-V4-Pro Thinking 靶向修改)",
 }
@@ -140,6 +141,8 @@ def main():
         "score": 0,
         "evaluation_feedback": "",
         "iteration_count": 0,
+        "difficulty_flag": "",
+        "node_status": "",
     }
 
     seen_nodes = set()

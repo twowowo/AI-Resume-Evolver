@@ -1,17 +1,5 @@
-from typing import TypedDict, List, Annotated
+from typing import TypedDict, Annotated
 import operator
-
-
-class GraphState(TypedDict):
-    """v1.0 简单管线状态（main.py / debug_run.py 使用）"""
-    raw_resume: str
-    target_jd: str
-    gap_list: List[str]
-    rich_context_list: List[str]
-    rag_context: str
-    refined_resume: str
-    feedback: str
-    revision_count: int
 
 
 class AgentState(TypedDict):
@@ -26,3 +14,6 @@ class AgentState(TypedDict):
     score: int
     evaluation_feedback: str
     iteration_count: int
+    # v2.0-beta 分诊熔断
+    difficulty_flag: str       # "" | "EXTREME_GAP" — 由 evaluator 在首轮评分 < 40 时设置
+    node_status: str           # 当前节点的运行态描述，用于 UI 流式展示
