@@ -17,3 +17,8 @@ class AgentState(TypedDict):
     # v2.0-beta 分诊熔断
     difficulty_flag: str       # "" | "EXTREME_GAP" — 由 evaluator 在首轮评分 < 40 时设置
     node_status: str           # 当前节点的运行态描述，用于 UI 流式展示
+    # v2.4 API 层：维度分数持久化
+    pre_eval_dimensions: dict  # pre_evaluator 返回的维度细分 (jd_match/jd_tool_coverage/jd_depth_premium/star_completion/verb_quality)
+    eval_dimensions: dict      # evaluator 返回的维度细分 (jd_match/star_completion/verb_quality)
+    # v2.5 MockInterviewer 压力测试
+    stress_test_questions: list  # interviewer 节点生成的压测面试题

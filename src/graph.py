@@ -1,5 +1,5 @@
 """
-v2.2 LangGraph 多智能体工作流 —— 前置分诊 + 路由解耦
+v2.5 LangGraph 多智能体工作流 —— 前置分诊 + MockInterviewer 并网
 
 图结构:
     retriever
@@ -22,15 +22,19 @@ v2.2 LangGraph 多智能体工作流 —— 前置分诊 + 路由解耦
       evaluator        evaluator
          │                │
          ▼                ▼
-        END         [eval_condition]
-                    │           │
-                 polisher      END
-                    │
-               [eval_condition]
-                    │           │
-                evaluator      END
+    [eval_condition]  [eval_condition]
+         │                │
+    interviewer       polisher ←──┘
+         │                │
+         ▼                ▼
+        END          [eval_condition]
+                     │           │
+                evaluator    interviewer
+                     │           │
+                     ▼           ▼
+                [loop...]      END
 
-  流程锁死: 所有简历必须至少经过一轮 Editor 优化, 无条件进入 evaluator 终审。
+  流程锁死: 所有简历必须经过 Editor → Evaluator → Interviewer 完整链路
 """
 
 import os
@@ -41,6 +45,7 @@ from src.nodes.editor import editor_node
 from src.nodes.evaluator import evaluator_node
 from src.nodes.polisher import polisher_node
 from src.nodes.pre_evaluator import pre_evaluator_node
+from src.nodes.interviewer import interviewer_node
 from src.tools.search import tavily_search_node, _detect_company, _extract_tech_keywords
 
 _web_search_always = os.getenv("FORCE_WEB_SEARCH", "false").lower() == "true"
@@ -107,25 +112,28 @@ def pre_eval_routing(state: AgentState) -> str:
 
 def eval_condition(state: AgentState) -> str:
     """
-    v2.2 Evaluator 之后的路由（对优化后简历评分）：
+    v2.5 Evaluator 之后的路由（对优化后简历评分）：
 
-    - EXTREME_GAP: 防幻觉骨架模式完成，单轮放行 -> END
-    - score >= 70: 闪电战通关 -> END
-    - 40 <= score < 70: 进入 polisher 精细博弈（最多 MAX_ITERATIONS 轮）
-    - score < 40 (安全网): 硬核重组 -> polisher -> END
+    - EXTREME_GAP: 防幻觉骨架模式完成 → Interviewer (生成压测题后 END)
+    - score >= 70: 闪电战通关 → Interviewer → END
+    - 30 <= score < 70: 进入 polisher 精细博弈（最多 MAX_ITERATIONS 轮）
+    - score < 30 (安全网): 硬核重组 → polisher
+    - 迭代耗尽: → Interviewer → END
+
+    所有简历必经 MockInterviewer 压力测试后才能结束。
     """
     score = state.get("score", 0)
     iteration = state.get("iteration_count", 0)
     difficulty = state.get("difficulty_flag", "")
 
-    # 熔断路径：防幻觉骨架模式执行完，直接放行
+    # 熔断路径：防幻觉骨架模式执行完 → 压测题 → END
     if difficulty == "EXTREME_GAP":
-        print(f"[graph] 防幻觉骨架模式完成 (difficulty_flag=EXTREME_GAP)，直接放行 -> END")
-        return END
+        print(f"[graph] 防幻觉骨架模式完成 (difficulty_flag=EXTREME_GAP) -> Interviewer 压测 -> END")
+        return "interviewer"
 
     if score >= PASS_THRESHOLD:
-        print(f"[graph] 闪电战通关: 评分 {score} >= {PASS_THRESHOLD} -> END")
-        return END
+        print(f"[graph] 闪电战通关: 评分 {score} >= {PASS_THRESHOLD} -> Interviewer 压测 -> END")
+        return "interviewer"
 
     if score >= CRITICAL_LOW_THRESHOLD:
         if iteration < MAX_ITERATIONS:
@@ -133,13 +141,13 @@ def eval_condition(state: AgentState) -> str:
                   f"第 {iteration + 1}/{MAX_ITERATIONS} 轮 -> 精细博弈 (Polisher)")
             return "polisher"
         else:
-            print(f"[graph] 精细博弈已达上限: {iteration}/{MAX_ITERATIONS} 轮，评分 {score}，强制放行 -> END")
-            return END
+            print(f"[graph] 精细博弈已达上限: {iteration}/{MAX_ITERATIONS} 轮，评分 {score} -> Interviewer 压测 -> END")
+            return "interviewer"
     else:
-        # v2.1: 理论上不会走到这里（EXTREME_GAP 由 pre_evaluator 提前拦截）
-        # 但保留作为安全网
+        # v2.5: 安全网 → polisher 最后一搏（polisher 完成后会再次进入 eval_condition，
+        # 届时 iteration >= MAX_ITERATIONS 会走到 interviewer）
         print(f"[graph] 意外低分: 评分 {score} < {CRITICAL_LOW_THRESHOLD}，"
-              f"触发硬核单轮重组 -> Polisher (全力一击后直接 END)")
+              f"触发硬核单轮重组 -> Polisher (完成后进 Interviewer)")
         return "polisher"
 
 
@@ -152,6 +160,7 @@ def build_graph():
     workflow.add_node("editor", editor_node)
     workflow.add_node("evaluator", evaluator_node)
     workflow.add_node("polisher", polisher_node)
+    workflow.add_node("interviewer", interviewer_node)
 
     workflow.set_entry_point("retriever")
 
@@ -180,25 +189,30 @@ def build_graph():
     # editor -> evaluator
     workflow.add_edge("editor", "evaluator")
 
-    # evaluator -> 分诊路由 (polisher 或 END)
+    # evaluator -> 分诊路由 (polisher 或 interviewer)
     workflow.add_conditional_edges(
         "evaluator",
         eval_condition,
         {
             "polisher": "polisher",
+            "interviewer": "interviewer",
             END: END,
         },
     )
 
-    # polisher -> 分诊路由 (回到 evaluator 或 END)
+    # polisher -> 分诊路由 (回到 evaluator 或 interviewer)
     workflow.add_conditional_edges(
         "polisher",
         eval_condition,
         {
             "polisher": "polisher",
+            "interviewer": "interviewer",
             END: END,
         },
     )
+
+    # interviewer -> END (压测题生成后直接结束)
+    workflow.add_edge("interviewer", END)
 
     return workflow.compile()
 
@@ -227,6 +241,9 @@ def run_pipeline(resume: str, jd: str) -> AgentState:
         "iteration_count": 0,
         "difficulty_flag": "",
         "node_status": "",
+        "pre_eval_dimensions": {},
+        "eval_dimensions": {},
+        "stress_test_questions": [],
     }
     result = app.invoke(initial)
     return result
@@ -246,6 +263,9 @@ def run_pipeline_stream(resume: str, jd: str):
         "iteration_count": 0,
         "difficulty_flag": "",
         "node_status": "",
+        "pre_eval_dimensions": {},
+        "eval_dimensions": {},
+        "stress_test_questions": [],
     }
 
     final = None
