@@ -19,7 +19,8 @@ v2.6 更新:
   - 同步 LangGraph 调用通过 ThreadPoolExecutor + asyncio.Queue 隔离，不影响事件循环
   - 保留 run_in_threadpool + timeout_keep_alive=300 弹性配置
 """
-
+#uvicorn main:app --host 127.0.0.1 --port 8001 --reload
+#npm run dev
 import json
 import os
 import sys
@@ -227,6 +228,8 @@ async def _stream_pipeline(initial_state: dict):
                          pre_eval_dims.get("star_completion", 0) +
                          pre_eval_dims.get("verb_quality", 0))
 
+            is_extreme_gap = final_state.get("difficulty_flag", "") == "EXTREME_GAP"
+
             yield _sse_event("final", {
                 "optimized_resume_radar": {
                     "jd_matching_score": opt_radar.jd_matching_score if opt_radar else 0,
@@ -237,6 +240,7 @@ async def _stream_pipeline(initial_state: dict):
                 "optimized_resume_text": final_state.get("revised_resume", ""),
                 "stress_test_questions": questions,
                 "difficulty_flag": final_state.get("difficulty_flag", ""),
+                "is_extreme_gap": is_extreme_gap,
                 "iteration_count": final_state.get("iteration_count", 0),
                 "score_improvement": eval_score - pre_total if pre_total > 0 else 0,
                 "internal_monologue": final_state.get("internal_monologue", ""),

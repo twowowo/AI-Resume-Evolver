@@ -1,15 +1,15 @@
 """
-v2.7 Editor 节点 —— 纯 JSON 输出 + 物理隔离 + 长话短说约束
+v3.0 Editor 节点 —— 纯净 Markdown 流 + XML 物理隔离 + 全量保留
 
 核心升级:
-  - LLM 必须且只能输出纯净 JSON，禁止自由 Markdown
-  - optimization_summary → 前端看板消费
-  - clean_resume_json → 前端 A4 纸视口渲染
-  - 每个项目 Action ≤ 3 条，每条 ≤ 2 行，HR 10 秒阅完
+  - 彻底移除 JSON 键值对约束，LLM 输出纯净 Markdown
+  - 物理隔离: 思考/废话丢弃，<clean_resume>...</clean_resume> 内为 A4 纸渲染内容
+  - 全量保留: 教育背景/实习经历/项目经历/校园经历/获奖情况/技能特长 一个不删
+  - 三段式 | 分隔: 时间段 | 机构名称 | 身份或专业
+  - 零噪音: 禁止 (估算)/(待确认指标)/项目周期：未注明 等机器垃圾
 """
 
 import os
-import json as json_mod
 import re
 from src.state import AgentState
 from src.utils.llm import get_flash_client, get_pro_client
@@ -83,220 +83,218 @@ def _extract_thinking(response) -> str:
     return ""
 
 
-# ── JSON 解析 ──────────────────────────────────────────────────
+# ── XML 标签解析 ──────────────────────────────────────────────────
 
-def _parse_editor_json(response_text: str) -> dict:
-    """从 LLM 响应中提取 JSON，带容错回退"""
-    json_match = re.search(r"\{[\s\S]*\}", response_text)
-    if not json_match:
-        return {"error": "no_json_found", "raw": response_text[:500]}
-    try:
-        data = json_mod.loads(json_match.group(0))
-        if "clean_resume_json" not in data:
-            return {"error": "missing_clean_resume_json", "raw": response_text[:500]}
-        return data
-    except json_mod.JSONDecodeError:
-        return {"error": "json_parse_error", "raw": json_match.group(0)[:500]}
+_CLEAN_RESUME_RE = re.compile(
+    r"<clean_resume>\s*([\s\S]*?)\s*</clean_resume>",
+    re.IGNORECASE,
+)
 
 
-def _json_to_text(data: dict) -> str:
-    """将 clean_resume_json 转换为可读纯文本（用于流式打字机展示）"""
-    lines = []
-    name = data.get("name", "")
-    title = data.get("title", "")
-    if name:
-        header = name if not title else f"{name} · {title}"
-        lines.append(header)
-        lines.append("")
-
-    summary = data.get("summary", "")
-    if summary:
-        lines.append("个人总结")
-        lines.append(summary)
-        lines.append("")
-
-    skills = data.get("skills", [])
-    if skills:
-        lines.append("核心技能")
-        lines.append(" / ".join(skills))
-        lines.append("")
-
-    experience = data.get("experience", [])
-    if experience:
-        lines.append("工作经历")
-        lines.append("")
-        for exp in experience:
-            company = exp.get("company", "")
-            role = exp.get("role", "")
-            period = exp.get("period", "")
-            header_parts = [p for p in [company, role, period] if p]
-            lines.append(" · ".join(header_parts))
-            for action in exp.get("actions", []):
-                lines.append(f"- {action}")
-            lines.append("")
-
-    education = data.get("education")
-    if education:
-        lines.append("教育背景")
-        parts = [education.get(k, "") for k in ["school", "degree", "period"] if education.get(k, "")]
-        lines.append(" · ".join(parts))
-
-    return "\n".join(lines)
+def _extract_clean_markdown(response_text: str) -> str:
+    """从 LLM 响应中提取 <clean_resume>...</clean_resume> 内的纯净 Markdown"""
+    match = _CLEAN_RESUME_RE.search(response_text)
+    if match:
+        return match.group(1).strip()
+    # 回退: 如果没找到标签，尝试去掉常见前缀废话
+    fallback = response_text.strip()
+    for marker in ["好的，以下是", "以下是优化后的", "这是优化后的", "```markdown", "```"]:
+        idx = fallback.find(marker)
+        if idx >= 0:
+            fallback = fallback[idx + len(marker):].strip()
+    # 去掉尾部 ``` 标记
+    if fallback.endswith("```"):
+        fallback = fallback[:-3].strip()
+    return fallback
 
 
-# ── v2.7 System Prompt（纯 JSON 输出）────────────────────────────
+# ── v3.0 System Prompt（纯净 Markdown + XML 物理隔离）────────────────
 
-EDITOR_SYSTEM_PROMPT = """你是一位拥有 10 年经验的大厂（字节跳动/阿里巴巴/腾讯）资深技术架构师兼首席猎头。你的任务是优化简历。你必须严格遵守以下规则，**绝对不允许输出任何闲聊、问候语或 Markdown 格式**。
+EDITOR_SYSTEM_PROMPT = """你是一位拥有 10 年经验的大厂（字节跳动/阿里巴巴/腾讯）资深技术架构师兼首席猎头。你的任务是将原始简历优化为一份排版精美、内容完整、可直接打印的高质量 Markdown 简历。
 
-══════════════════════════════════════════════════
-【铁律零】仅输出 JSON，禁止任何额外文字
-══════════════════════════════════════════════════
-你的整个响应必须是合法的 JSON 对象，不能有任何前缀或后缀文字。
-严禁输出诸如"好的，以下是优化后的简历"、"这是 JSON 格式"之类的废话。
-如果无法完成任务，JSON 中的字段用空值填充。
+══════════════════════════════════════════════════════════
+【铁律零】物理隔离 — 思考与输出彻底分离
+══════════════════════════════════════════════════════════
+你可以在 <clean_resume> 标签之外进行简短的专业分析思考（如动词替换理由、STAR 补全策略），但这部分将被系统丢弃，不会展示给用户。
+真正要渲染到 A4 纸上的纯净简历，必须严格包裹在 <clean_resume>...</clean_resume> XML 标签内。
 
-══════════════════════════════════════════════════
-【铁律一】STAR 融合 — 禁止二级标题
-══════════════════════════════════════════════════
-每个项目的每条 action 必须将 Situation/Task/Action/Result 融合进一句话中。
+正确格式示例:
+<clean_resume>
+## 教育背景
+...
+## 实习经历
+...
+</clean_resume>
+
+<clean_resume> 标签内必须是纯净的 Markdown，不允许任何闲聊、问候语、或"以下是优化后的简历"之类的废话。
+XML 标签必须正确闭合，否则简历无法渲染。
+
+══════════════════════════════════════════════════════════
+【铁律一】全量保留死命令 — 一个模块、一个数据都不许删
+══════════════════════════════════════════════════════════
+你必须全量保留原简历中的每一个模块及其含金量数据，禁止擅自删减。包括但不限于：
+  - 教育背景
+  - 实习经历（对在校生/应届生，严禁将"实习经历"改称"工作经历"！）
+  - 项目经历
+  - 校园经历（社团、学生会、志愿者等）
+  - 获奖情况
+  - 技能特长
+
+每个模块的量化数据（GPA、排名、奖项级别、项目成果数字）必须原样保留。
+宁可内容稍多，绝不擅自阉割——HR 比你更清楚什么信息对候选人重要。
+
+══════════════════════════════════════════════════════════
+【铁律二】STAR 融合 — 拒绝口水话，拒绝二级标题
+══════════════════════════════════════════════════════════
+每个项目/实习的每条要点必须将 Situation/Task/Action/Result 融合进一句话。
 严禁出现「情景」「任务」「行动」「结果」等二级标题字样。
 用强动词直接切入：在什么场景下 → 做了什么 → 取得什么量化成果。
 
-示例 ─ 错误写法（禁止）:
-  "情景：订单系统日均50万请求，数据库压力大"
-  "行动：引入 Redis 缓存层"
+正确示例:
+- 针对日均 50 万请求下数据库压力瓶颈，设计 Redis 多级缓存方案，P99 延迟从 2s 降至 200ms
 
-示例 ─ 正确写法（仅此格式）:
-  "针对日均 50 万请求下数据库压力瓶颈，设计 Redis 多级缓存方案，P99 延迟从 2s 降至 200ms（估算）"
+错误示例（禁止）:
+- 情景：订单系统日均50万请求，数据库压力大
+- 行动：引入 Redis 缓存层
 
-══════════════════════════════════════════════════
-【铁律二】Action 字数死锁
-══════════════════════════════════════════════════
-- 每个项目的 actions 数组最多 3 条，每项不超过 2 行（约 80 字）
-- 超过 3 条直接截断！只保留最有冲击力的 3 条
-- 每条必须包含可量化数据（标注"估算"或"待确认指标"均可）
-- 拒绝口水话：禁止"摒弃了传统的..."、"充分考虑了..."等废话开头，直接切动词
-
-══════════════════════════════════════════════════
+══════════════════════════════════════════════════════════
 【铁律三】动词升级 — 禁用平庸词
-══════════════════════════════════════════════════
-严禁：负责、参与、做了、写了、用过、维护、处理、开发
-必须：主导、构建、攻克、重塑、调优、消除、标准化、精细化、逆向、渗透、压榨
+══════════════════════════════════════════════════════════
+严禁使用: 负责、参与、做了、写了、用过、维护、处理、开发
+必须使用: 主导、构建、攻克、重塑、调优、消除、标准化、精细化、逆向、渗透、压榨、重构、设计、实现
 
-术语注入库（匹配平替词汇）：
+术语注入库（匹配平替词汇）:
 {term_injection}
 
-══════════════════════════════════════════════════
-【铁律四】技术深度 + 量化
-══════════════════════════════════════════════════
-基于已有技术栈合理推导技术细节并标注。每条 action 必须具备：
-- 技术原理（用了什么 + 怎么用的 + 为什么）
-- 量化成果（性能提升 % / 延迟变化 / 成本降低等，标注"估算"或"待确认指标"）
+══════════════════════════════════════════════════════════
+【铁律四】禁止机器噪音 — 简历必须严肃专业
+══════════════════════════════════════════════════════════
+以下词汇及类似表述严禁出现在 <clean_resume> 内的任何位置:
+  - （估算）
+  - （待确认指标）
+  - （待确认）
+  - 项目周期：未注明
+  - [请填入...]
+  - （注：...）
+  - （约）
+  - 大约、大概、左右
 
-金牌案例（深度利用其技术方案和量化数字）：
+简历必须像一份真实的、可以直接投递的正式文档。任何括号注释都会破坏 HR 的信任感。
+如需标注量化数据，直接写数字，不要画蛇添足加括号注释。
+
+══════════════════════════════════════════════════════════
+【铁律五】经历行三段式绝对格式 — 必须用 | 分隔
+══════════════════════════════════════════════════════════
+任何经历（学校、公司、实习单位、校园组织）的第一行描述，必须且只能使用以下格式:
+
+时间段 | 机构名称 | 身份或专业
+
+正确示例:
+2020.09 - 2024.06 | 北京大学 | 计算机科学与技术 · 本科
+2025.11 - 2026.05 | 腾讯科技（深圳）有限公司 | 实习算法工程师
+2023.06 - 2023.09 | 字节跳动 | 后端开发实习生
+2020.09 - 2022.06 | 校学生会外联部 | 部长
+
+严禁使用其他分隔符（如逗号、破折号、空格对齐），必须严格使用竖线 | 分隔三段。
+
+══════════════════════════════════════════════════════════
+【铁律六】技能特长格式 — 分类硬换行
+══════════════════════════════════════════════════════════
+技能特长模块必须使用 **类别名：** 格式，每个大类独立一行:
+
+正确格式:
+**编程语言：** Python, Java, C++, Go
+**AI 工程化：** PyTorch, LangChain, LlamaIndex, vLLM
+**数据库与中间件：** MySQL, Redis, Kafka, Elasticsearch
+**DevOps：** Docker, Kubernetes, CI/CD, Prometheus
+
+严禁将所有技能揉成一团文字。
+
+══════════════════════════════════════════════════════════
+【铁律七】技术深度 + 量化
+══════════════════════════════════════════════════════════
+基于已有技术栈合理推导技术细节。每条要点必须具备:
+  - 技术原理（用了什么 + 怎么用的 + 为什么）
+  - 量化成果（性能提升 % / 延迟变化 / 成本降低等，直接写数字）
+
+金牌案例（深度利用其技术方案和量化数字）:
 {golden_cases}
 
-══════════════════════════════════════════════════
-【铁律五】严禁编造
-══════════════════════════════════════════════════
+══════════════════════════════════════════════════════════
+【铁律八】严禁编造
+══════════════════════════════════════════════════════════
 - 绝对不添加原始简历中不存在的新技术栈
 - 绝对不编造未参与过的项目或未担任过的职位
 - 允许基于已有经验进行合理的技术深度延伸
 
-══════════════════════════════════════════════════
-【铁律六】只输出以下 JSON 结构
-══════════════════════════════════════════════════
-
-{{
-  "optimization_summary": "<2-3 句话，简述核心优化手段：动词升级了哪些、STAR 补全了什么、量化提升了什么>",
-  "clean_resume_json": {{
-    "name": "<姓名>",
-    "title": "<目标职位>",
-    "summary": "<2-3 句自我评价，强动词开头，关键数字突出>",
-    "skills": ["<技术栈1>", "<技术栈2>", "..."],
-    "experience": [
-      {{
-        "company": "<公司名>",
-        "role": "<职位>",
-        "period": "<时间范围>",
-        "actions": [
-          "<S+T+A+R 融合描述，含量化指标（估算）>",
-          "..."
-        ]
-      }}
-    ],
-    "education": {{
-      "school": "<学校名>",
-      "degree": "<学位 · 专业方向>",
-      "period": "<就读时间>"
-    }}
-  }}
-}}
-
-actions 最多 3 条！必须融合 STAR，禁止二级标题。每条量化标注"（估算）"或"（待确认指标）"。
+══════════════════════════════════════════════════════════
+【铁律九】Markdown 排版规范
+══════════════════════════════════════════════════════════
+- 模块标题（教育背景、实习经历等）使用 ## 二级标题，简洁有力
+- 每个 ## 标题前保留一个空行，确保视觉呼吸感
+- 经历的第一行使用 | 三段式分隔（时间段 | 机构 | 身份）
+- 每条要点使用 - 开头（无序列表），每条占一行
+- 技能使用 **类别：** 加粗格式，每个大类独立一行
+- 获奖情况使用 - 列表，每项一行
 
 ──────────────────────────────
 
-【联网搜索补充】：
+【联网搜索补充】:
 {web_search_context}
 
-【目标岗位 JD】：
+【目标岗位 JD】:
 {jd}
 
-【原始简历】：
+【原始简历】:
 {resume}
 
-仅输出 JSON："""
+现在请分析原始简历的不足之处，然后用 <clean_resume> 标签输出优化后的纯净 Markdown 简历。记住: <clean_resume> 之外的内容会被丢弃。"""
 
 
 # ── EXTREME_GAP 防幻觉骨架模式 Prompt ─────────────────────────────
 
 EDITOR_EXTREME_GAP_PROMPT = """你是一位诚实的职业规划顾问。当前场景：候选人与目标 JD 之间存在极端差距 (EXTREME_GAP)。
 
-你必须遵守以下铁律，**且只能输出 JSON，禁止任何额外文字**。
+你必须遵守以下铁律:
 
-══════════════════════════════════════════════════
-【铁律一】严禁编造
-══════════════════════════════════════════════════
+══════════════════════════════════════════════════════════
+【铁律一】物理隔离
+══════════════════════════════════════════════════════════
+最终简历必须包裹在 <clean_resume>...</clean_resume> 标签内。标签外内容会被丢弃。
+
+══════════════════════════════════════════════════════════
+【铁律二】严禁编造
+══════════════════════════════════════════════════════════
 - 绝对不编造虚假项目经验、新技术栈、未参与的架构设计
 - 不把"个人博客"包装成"企业级微服务平台"
 
-══════════════════════════════════════════════════
-【铁律二】标准骨架搭建模式
-══════════════════════════════════════════════════
+══════════════════════════════════════════════════════════
+【铁律三】标准骨架搭建模式
+══════════════════════════════════════════════════════════
 - 用 STAR 融合结构组织已有项目
 - 平庸动词升级为中等动词（实现/设计/构建/优化）
 - 缺失信息用方括号占位符留白：[请填入您的日均订单量]
-- 每个项目 actions ≤ 3 条
+- 每条要点 ≤ 3 条
 
-══════════════════════════════════════════════════
-【铁律三】仅输出 JSON
-══════════════════════════════════════════════════
+══════════════════════════════════════════════════════════
+【铁律四】Markdown 格式
+══════════════════════════════════════════════════════════
+- 模块标题使用 ##
+- 经历第一行使用 | 三段式: 时间段 | 机构名称 | 身份或专业
+- 要点使用 - 列表
+- 技能使用 **类别：** 格式
+- 禁止 (估算)、(待确认指标) 等噪音词
 
-{{
-  "optimization_summary": "<1-2 句说明骨架搭建策略和占位符数量>",
-  "clean_resume_json": {{
-    "name": "<姓名>",
-    "title": "<目标职位>",
-    "summary": "<自我评价，缺失信息用占位符>",
-    "skills": ["<已有技术栈>", "..."],
-    "experience": [
-      {{
-        "company": "<公司名>",
-        "role": "<职位>",
-        "period": "<时间>",
-        "actions": ["<S+T+A+R 融合，缺失处用 [请填入...] >"]
-      }}
-    ],
-    "education": {{"school": "...", "degree": "...", "period": "..."}}
-  }}
-}}
+══════════════════════════════════════════════════════════
+【铁律五】全量保留
+══════════════════════════════════════════════════════════
+原简历的每个模块必须保留，一个不能删。
 
-【联网搜索补充】：{web_search_context}
-【目标岗位 JD】：{jd}
-【原始简历】：{resume}
+【联网搜索补充】: {web_search_context}
+【目标岗位 JD】: {jd}
+【原始简历】: {resume}
 
-仅输出 JSON："""
+现在请用 <clean_resume> 标签输出骨架搭建后的 Markdown 简历。"""
 
 
 # ── 毒舌批评 ────────────────────────────────────────────────────
@@ -318,8 +316,8 @@ def _build_critique(original: str, revised_text: str, thinking_text: str = "",
         lines.append("")
         lines.append("[本次修改侧重点]")
     lines.append("- 将所有平庸动词替换为大厂级词汇（主导/构建/攻克/精炼）。")
-    lines.append("- 每个项目经历融合 STAR 结构为精简 action 条目，补充分层技术细节。")
-    lines.append("- 参考金牌案例中的量化模式，为关键指标标注'（估算）'或'（待确认指标）'。")
+    lines.append("- 每个项目经历融合 STAR 结构为精简要点，补充分层技术细节。")
+    lines.append("- 参考金牌案例中的量化模式，去除所有机器噪音标记。")
     lines.append(f"- 优化后简历长度：{len(revised_text)} 字符（原文 {len(original)} 字符）。")
 
     if thinking_text:
@@ -333,13 +331,13 @@ def _build_critique(original: str, revised_text: str, thinking_text: str = "",
 
 def editor_node(state: AgentState):
     """
-    v2.7 核心优化节点 —— 纯 JSON 输出 + 物理隔离
+    v3.0 核心优化节点 —— 纯净 Markdown 流 + XML 物理隔离
 
-    输出 JSON 结构:
-      - optimization_summary → 前端优化说明看板
-      - clean_resume_json → 前端 A4 纸视口
-
-    双模式: NORMAL (大厂级优化) / EXTREME_GAP (防幻觉骨架)
+    输出:
+      - revised_resume: <clean_resume> 内的纯净 Markdown 文本（前端 A4 纸渲染）
+      - internal_monologue: 毒舌批评 + 优化分析
+      - optimization_summary: 标签外的简短策略说明
+      - clean_resume_json: {}（v3.0 已弃用 JSON，保留字段兼容）
     """
     resume = state.get("resume", "")
     jd = state.get("jd", "")
@@ -368,9 +366,7 @@ def editor_node(state: AgentState):
             jd=jd,
             resume=resume,
         )
-        mode_label = "防幻觉骨架模式 (EXTREME_GAP)"
-        use_pro = False
-        print(f"[editor] 触发防幻觉骨架模式！Prompt {len(prompt)} 字符")
+        print(f"[editor] 触发防幻觉骨架模式 (EXTREME_GAP), Prompt {len(prompt)} 字符")
 
         try:
             llm = get_flash_client()
@@ -386,34 +382,21 @@ def editor_node(state: AgentState):
                 "clean_resume_json": {},
             }
 
-        parsed = _parse_editor_json(response_text)
-        if "error" in parsed:
-            print(f"[editor] JSON 解析失败 ({parsed['error']})，回退原始文本")
-            return {
-                "revised_resume": response_text,
-                "internal_monologue": f"[editor] 骨架模式 JSON 解析失败 ({parsed['error']})，回退为原始输出。",
-                "optimization_summary": "",
-                "clean_resume_json": {},
-            }
+        clean_md = _extract_clean_markdown(response_text)
+        placeholder_count = clean_md.count("[请")
 
-        clean_json = parsed.get("clean_resume_json", {})
-        opt_summary = parsed.get("optimization_summary", "")
-        revised_text = _json_to_text(clean_json)
-        placeholder_count = revised_text.count("[请")
-
-        print(f"[editor] 骨架模式完成, 输出 {len(revised_text)} 字符, 占位符 {placeholder_count} 处")
+        print(f"[editor] 骨架模式完成, 输出 {len(clean_md)} 字符, 占位符 {placeholder_count} 处")
 
         monologue = (
             f"[editor 防幻觉骨架模式] EXTREME_GAP，已禁用大厂级动词升级和量化编造。\n"
-            f"转为标准骨架搭建。输出 {len(revised_text)} 字符，{placeholder_count} 处占位符留白。\n"
-            f"{opt_summary}"
+            f"转为标准骨架搭建。输出 {len(clean_md)} 字符，{placeholder_count} 处占位符留白。\n"
         )
 
         return {
-            "revised_resume": revised_text,
+            "revised_resume": clean_md,
             "internal_monologue": monologue,
-            "optimization_summary": opt_summary,
-            "clean_resume_json": clean_json,
+            "optimization_summary": "",
+            "clean_resume_json": {},
         }
 
     # ── 正常模式 ──
@@ -436,7 +419,7 @@ def editor_node(state: AgentState):
     use_pro = os.getenv("USE_PRO_MODEL", "false").lower() == "true"
     model_label = "DeepSeek-V4-Pro (Thinking)" if use_pro else "DeepSeek-V4-Flash"
 
-    print(f"[editor] 调用 {model_label} (v2.7 纯 JSON 模式)...")
+    print(f"[editor] 调用 {model_label} (v3.0 纯净 Markdown 流)...")
     print(f"[editor] Prompt {len(prompt)} 字符, RAG {len(rag_items)} 条")
 
     try:
@@ -462,11 +445,11 @@ def editor_node(state: AgentState):
         print(thinking_text[:1500])
         print("-" * 40)
 
-    # ── 解析 JSON 响应 ──
-    parsed = _parse_editor_json(response_text)
+    # ── 提取 <clean_resume> 内的纯净 Markdown ──
+    clean_md = _extract_clean_markdown(response_text)
 
-    if "error" in parsed:
-        print(f"[editor] JSON 解析失败 ({parsed['error']})，回退原始文本为 revised_resume")
+    if not clean_md or len(clean_md) < 50:
+        print(f"[editor] <clean_resume> 提取失败或内容过短 ({len(clean_md)} 字符)，回退原始输出")
         monologue = _build_critique(resume, response_text, thinking_text)
         return {
             "revised_resume": response_text,
@@ -475,23 +458,26 @@ def editor_node(state: AgentState):
             "clean_resume_json": {},
         }
 
-    clean_json = parsed.get("clean_resume_json", {})
-    opt_summary = parsed.get("optimization_summary", "")
+    # ── 构建优化说明 ──
+    summary_lines = []
+    if thinking_text:
+        # 从思维链中提取前两句作为优化说明
+        thinking_sentences = re.split(r"[。；\n]", thinking_text, maxsplit=2)
+        summary_lines = [s.strip() for s in thinking_sentences[:2] if s.strip() and len(s.strip()) >= 10]
+    optimization_summary = "；".join(summary_lines) if summary_lines else ""
 
-    # 将结构化 JSON 转为可读文本（供流式打字机展示）
-    revised_text = _json_to_text(clean_json)
+    # ── 构建内省 ──
+    monologue = _build_critique(resume, clean_md, thinking_text, optimization_summary)
 
-    # 构建内省
-    monologue = _build_critique(resume, revised_text, thinking_text, opt_summary)
-
-    exp_count = len(clean_json.get("experience", []))
-    action_count = sum(len(exp.get("actions", [])) for exp in clean_json.get("experience", []))
-    print(f"[editor] v2.7 JSON 优化完成: {exp_count} 段经历, {action_count} 条 action, "
-          f"文本 {len(revised_text)} 字符, summary {len(opt_summary)} 字符")
+    # ── 统计信息 ──
+    h2_count = len(re.findall(r"^##\s", clean_md, re.MULTILINE))
+    pipe_count = len(re.findall(r"\|", clean_md))
+    print(f"[editor] v3.0 Markdown 优化完成: {len(clean_md)} 字符, {h2_count} 个 ## 模块, "
+          f"{pipe_count} 处 | 分隔符, summary {len(optimization_summary)} 字符")
 
     return {
-        "revised_resume": revised_text,
+        "revised_resume": clean_md,
         "internal_monologue": monologue,
-        "optimization_summary": opt_summary,
-        "clean_resume_json": clean_json,
+        "optimization_summary": optimization_summary,
+        "clean_resume_json": {},
     }
