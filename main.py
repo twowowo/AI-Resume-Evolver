@@ -86,7 +86,7 @@ def _build_stress_questions(raw_questions: list) -> list[dict]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动时预热 ChromaDB，关闭时清理"""
-    print("[server] AI-Resume-Evolver v2.6 启动中...")
+    print("[server] AI-Resume-Evolver v2.7 启动中...")
     print("[server] 预热 ChromaDB 连接...")
     try:
         from src.config import get_vector_db_client, get_collection_name
@@ -104,7 +104,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AI-Resume-Evolver API",
     description="AI 简历智能优化引擎 —— 一键生成 + 多智能体博弈 + MockInterviewer 压测",
-    version="2.6.0",
+    version="2.7.0",
     lifespan=lifespan,
 )
 
@@ -122,7 +122,7 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "version": "2.6.0", "service": "AI-Resume-Evolver"}
+    return {"status": "ok", "version": "2.7.0", "service": "AI-Resume-Evolver"}
 
 
 # ── SSE 流式管道 ──
@@ -201,11 +201,16 @@ async def _stream_pipeline(initial_state: dict):
             if not yielded_resume and state.get("revised_resume"):
                 yielded_resume = True
                 revised = state["revised_resume"]
+                opt_summary = state.get("optimization_summary", "")
+                clean_json = state.get("clean_resume_json", {})
                 yield _sse_event("resume_stream", {
                     "optimized_resume_text": revised,
                     "text_length": len(revised),
+                    "optimization_summary": opt_summary,
+                    "clean_resume_json": clean_json,
                 })
-                print(f"[sse] 分帧2 resume_stream: 精修文本 {len(revised)} 字符")
+                print(f"[sse] 分帧2 resume_stream: 精修文本 {len(revised)} 字符, "
+                      f"summary {len(opt_summary)} 字符, json_keys {list(clean_json.keys()) if clean_json else '[]'}")
 
         # ── 里程碑 3: 全链路完成 → 推送终评雷达 + 压测题 ──
         if final_state:
@@ -235,6 +240,11 @@ async def _stream_pipeline(initial_state: dict):
                 "iteration_count": final_state.get("iteration_count", 0),
                 "score_improvement": eval_score - pre_total if pre_total > 0 else 0,
                 "internal_monologue": final_state.get("internal_monologue", ""),
+                "evaluation_feedback": final_state.get("evaluation_feedback", ""),
+                "pre_eval_dimensions": pre_eval_dims,
+                "eval_dimensions": eval_dims,
+                "optimization_summary": final_state.get("optimization_summary", ""),
+                "clean_resume_json": final_state.get("clean_resume_json", {}),
             })
             print(f"[sse] 分帧3 final: 终评 {eval_score}/100, 压测题 {len(questions)} 道, "
                   f"提升 +{eval_score - pre_total if pre_total > 0 else 'N/A'} 分")
@@ -289,6 +299,8 @@ async def optimize_resume(request: ResumeOptimizeRequest):
         "pre_eval_dimensions": {},
         "eval_dimensions": {},
         "stress_test_questions": [],
+        "optimization_summary": "",
+        "clean_resume_json": {},
     }
 
     return StreamingResponse(
@@ -310,7 +322,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="127.0.0.1",       # v2.6: 死锁 127.0.0.1，根除 Windows 0.0.0.0 解析冲突
-        port=8000,
+        port=8001,
         reload=False,
         log_level="info",
         timeout_keep_alive=300,  # 长连接保活 5 分钟（覆盖串行 LLM 调用的完整链路）

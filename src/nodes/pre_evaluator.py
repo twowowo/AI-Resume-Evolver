@@ -155,6 +155,11 @@ PRE_EVALUATOR_SYSTEM_PROMPT = """你是一位严格的简历初审官。你的�
   "tier_assessment": "<1句话说明层级判定依据>",
   "core_tool_overlap": "<列出简历与JD共同覆盖的核心工具，如'FastAPI/Redis/MySQL/Docker'>",
   "tool_coverage_rate": "<百分比，如'75%'>",
+  "jd_matched_skills": ["<JD要求且简历已覆盖的技术栈>", ...],
+  "jd_missing_skills": ["<JD要求但简历未体现的技术栈>", ...],
+  "star_strengths": ["<原始简历STAR做得好的点>", ...],
+  "star_weaknesses": ["<原始简历STAR缺失的点>", ...],
+  "weak_verbs_found": ["<简历中弱动词>", ...],
   "feedback": "<列出最关键的 2-3 个问题>"
 }}
 
@@ -169,7 +174,7 @@ difficulty_flag 判定规则:
 
 
 def _parse_pre_eval_json(response_text: str, default_score: int = 20) -> dict:
-    """解析 PreEvaluator 返回的 JSON，适配 6-3-1 权重 + 双轨制"""
+    """解析 PreEvaluator 返回的 JSON，适配 6-3-1 权重 + 双轨制 + 结构化维度字段"""
     json_match = re.search(r"\{[\s\S]*\}", response_text)
     if not json_match:
         return {
@@ -201,6 +206,18 @@ def _parse_pre_eval_json(response_text: str, default_score: int = 20) -> dict:
             dims["star_completion"] = 8
         if "verb_quality" not in dims:
             dims["verb_quality"] = 3
+
+        # v2.7: 提取结构化维度明细字段，合并进 dimension_scores
+        if "jd_matched_skills" in data and isinstance(data["jd_matched_skills"], list):
+            dims["matched_skills"] = data["jd_matched_skills"]
+        if "jd_missing_skills" in data and isinstance(data["jd_missing_skills"], list):
+            dims["missing_skills"] = data["jd_missing_skills"]
+        if "star_strengths" in data and isinstance(data["star_strengths"], list):
+            dims["star_strengths"] = data["star_strengths"]
+        if "star_weaknesses" in data and isinstance(data["star_weaknesses"], list):
+            dims["star_weaknesses"] = data["star_weaknesses"]
+        if "weak_verbs_found" in data and isinstance(data["weak_verbs_found"], list):
+            dims["weak_verbs"] = data["weak_verbs_found"]
 
         data["dimension_scores"] = dims
 

@@ -244,6 +244,8 @@ def run_pipeline(resume: str, jd: str) -> AgentState:
         "pre_eval_dimensions": {},
         "eval_dimensions": {},
         "stress_test_questions": [],
+        "optimization_summary": "",
+        "clean_resume_json": {},
     }
     result = app.invoke(initial)
     return result
@@ -266,6 +268,8 @@ def run_pipeline_stream(resume: str, jd: str):
         "pre_eval_dimensions": {},
         "eval_dimensions": {},
         "stress_test_questions": [],
+        "optimization_summary": "",
+        "clean_resume_json": {},
     }
 
     final = None

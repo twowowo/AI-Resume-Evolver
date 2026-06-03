@@ -151,7 +151,13 @@ EVALUATOR_SYSTEM_PROMPT = """你是一个由 3 位资深面试官组成的评审
   "hallucination_detected": <true/false 是否检测到恶意捏造>,
   "hallucination_detail": "<如果检测到恶意捏造，列出具体内容；否则写'无'>",
   "strengths": "<1-2 句话总结本次优化的亮点>",
-  "feedback": "<逐条列出需要修改的具体问题，每条必须包含：哪个项目/段落 → 什么问题 → 具体的修改建议。如果 passed=true，写'精修已达到投递标准，无需进一步修改'>"
+  "feedback": "<逐条列出需要修改的具体问题，每条必须包含：哪个项目/段落 → 什么问题 → 具体的修改建议。如果 passed=true，写'精修已达到投递标准，无需进一步修改'>",
+  "jd_matched_skills": ["<JD 中要求且简历已覆盖的技术栈>", ...],
+  "jd_missing_skills": ["<JD 中要求但简历未体现的技术栈>", ...],
+  "star_strengths": ["<STAR 四要素中做得好的方面>", ...],
+  "star_weaknesses": ["<STAR 四要素中缺失或薄弱的方面>", ...],
+  "weak_verbs_found": ["<简历中发现的弱动词，如 负责/参与/做了>", ...],
+  "verb_upgrades": [{{"from": "<弱动词>", "to": "<推荐强动词>"}}, ...]
 }}
 
 重要：
@@ -165,7 +171,7 @@ EVALUATOR_SYSTEM_PROMPT = """你是一个由 3 位资深面试官组成的评审
 
 
 def _parse_evaluator_json(response_text: str, default_score: int = 50) -> dict:
-    """解析 Evaluator 返回的 JSON，带容错回退"""
+    """解析 Evaluator 返回的 JSON，带容错回退 + 结构化维度字段提取"""
     json_match = re.search(r"\{[\s\S]*\}", response_text)
     if not json_match:
         return {
@@ -193,6 +199,23 @@ def _parse_evaluator_json(response_text: str, default_score: int = 50) -> dict:
             data["strengths"] = ""
         if "feedback" not in data:
             data["feedback"] = "（无详细反馈）"
+
+        # v2.7: 提取结构化维度明细字段，合并进 dimension_scores
+        dims = data["dimension_scores"]
+        if "jd_matched_skills" in data and isinstance(data["jd_matched_skills"], list):
+            dims["matched_skills"] = data["jd_matched_skills"]
+        if "jd_missing_skills" in data and isinstance(data["jd_missing_skills"], list):
+            dims["missing_skills"] = data["jd_missing_skills"]
+        if "star_strengths" in data and isinstance(data["star_strengths"], list):
+            dims["star_strengths"] = data["star_strengths"]
+        if "star_weaknesses" in data and isinstance(data["star_weaknesses"], list):
+            dims["star_weaknesses"] = data["star_weaknesses"]
+        if "weak_verbs_found" in data and isinstance(data["weak_verbs_found"], list):
+            dims["weak_verbs"] = data["weak_verbs_found"]
+        if "verb_upgrades" in data and isinstance(data["verb_upgrades"], list):
+            dims["upgraded_verbs"] = data["verb_upgrades"]
+        data["dimension_scores"] = dims
+
         return data
     except json.JSONDecodeError as e:
         return {

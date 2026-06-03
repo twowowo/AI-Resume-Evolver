@@ -22,3 +22,6 @@ class AgentState(TypedDict):
     eval_dimensions: dict      # evaluator 返回的维度细分 (jd_match/star_completion/verb_quality)
     # v2.5 MockInterviewer 压力测试
     stress_test_questions: list  # interviewer 节点生成的压测面试题
+    # v2.7 Editor JSON 输出 + 物理隔离
+    optimization_summary: str   # editor 生成的简历优化说明综述（前端看板消费）
+    clean_resume_json: dict     # editor 生成的结构化简历数据（前端 A4 纸消费）
