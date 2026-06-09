@@ -1,4 +1,4 @@
-from typing import TypedDict, Annotated
+from typing import TypedDict, Annotated, List, Optional
 import operator
 
 
@@ -25,3 +25,8 @@ class AgentState(TypedDict):
     # v2.7 Editor JSON 输出 + 物理隔离
     optimization_summary: str   # editor 生成的简历优化说明综述（前端看板消费）
     clean_resume_json: dict     # editor 生成的结构化简历数据（前端 A4 纸消费）
+    # 💬 v3.0 交互问答模式新增数据动线
+    chat_history: Annotated[List[dict], operator.add]  # 自动追加多轮 [User, AI] 对话历史
+    user_supplement: str       # 用户在左侧输入框最新敲入的补充信息/修改意见
+    session_id: str            # 会话 ID (UUID)，对应前端 thread_id
+    turn_count: int            # 对话轮数累加计数器

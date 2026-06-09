@@ -77,6 +77,23 @@ class ResumeOptimizeRequest(BaseModel):
         default=OptimizeMode.ONE_CLICK,
         description="优化模式：one_click 一键生成 / interactive 交互博弈"
     )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="会话 ID (UUID)，用于交互模式断点续传。一键模式可选，服务端未传时自动生成"
+    )
+
+
+class ChatRequest(BaseModel):
+    """交互模式多轮对话请求体 —— 用于 /api/v1/resume/chat"""
+
+    thread_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="会话 ID (UUID)，与一键优化接口的 session_id 对应"
+    )
+    user_message: str = Field(
+        ..., min_length=1, max_length=5000,
+        description="用户输入的补充信息/修改意见"
+    )
 
 
 # ── 响应体子模型 ──

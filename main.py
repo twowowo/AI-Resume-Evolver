@@ -1,29 +1,35 @@
 """
-AI-Resume-Evolver  v2.6 FastAPI 路由网关
+AI-Resume-Evolver v3.0 FastAPI 路由网关
 
 端点:
   GET  /health                           — 健康检查
   POST /api/v1/resume/optimize           — 简历优化（SSE 流式事件推送）
+  POST /api/v1/resume/chat               — 多轮对话交互编辑（SSE 流式）
 
-一键生成模式 (ONE_CLICK) — SSE 流式三帧推送:
+一键生成模式 (ONE_CLICK) — SSE 流式四帧推送:
   Frame 1 (radar_init):   PreEvaluator 完成 → 原始简历 6-3-1 雷达指标，前端渲染初始雷达图
   Frame 2 (resume_stream): Editor 完成 → 精修简历全文，前端打字机渐进显示
   Frame 3 (final):        Evaluator+Interviewer 完成 → 终评雷达 + 3 道面试压测题
   Frame 4 (done):         流结束信号
 
-交互模式 (INTERACTIVE):
-  暂未实现，返回 501 Not Implemented。
+交互模式 (INTERACTIVE) — SSE 流式三帧推送:
+  Frame 1 (status):       chat_editor 增量编辑完成 → 当前节点状态 (复用 resume_stream 帧携带 node_status)
+  Frame 2 (resume_stream): 更新后的简历全文 + node_status 状态帧
+  Frame 3 (final):        Evaluator+Interviewer 完成 → 终评雷达 + 压测题
+  Frame N (done):         流结束信号
 
-v2.6 更新:
-  - ONE_CLICK 端点全面升级为 SSE StreamingResponse，用户可实时看到阶段性进度
-  - 同步 LangGraph 调用通过 ThreadPoolExecutor + asyncio.Queue 隔离，不影响事件循环
-  - 保留 run_in_threadpool + timeout_keep_alive=300 弹性配置
+v3.0 更新:
+  - 引入 MemorySaver 断点续传，全图编译挂载 checkpointer
+  - 新增 /api/v1/resume/chat 多轮对话端点，支持 thread_id 会话隔离
+  - graph 入口 router 自动分流一键模式 / 交互模式
+  - ONE_CLICK 端点对接共享图实例，自动生成 session_id 供后续 chat 续接
 """
 #uvicorn main:app --host 127.0.0.1 --port 8001 --reload
 #npm run dev
 import json
 import os
 import sys
+import uuid
 import asyncio
 import traceback
 from contextlib import asynccontextmanager
@@ -37,12 +43,17 @@ from src.schemas.resume import (
     RadarMetrics,
     OptimizeMode,
     ResumeOptimizeRequest,
+    ChatRequest,
 )
 from src.graph import build_graph
+from langgraph.checkpoint.memory import MemorySaver
 
 # ── 启动时加载 .env ──
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__) or ".", ".env"))
+
+# ── v3.0: 应用级共享图实例，挂载 MemorySaver 断点续传 ──
+_app_graph = build_graph(checkpointer=MemorySaver())
 
 
 # ── SSE 工具函数 ──
@@ -86,8 +97,9 @@ def _build_stress_questions(raw_questions: list) -> list[dict]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：启动时预热 ChromaDB，关闭时清理"""
-    print("[server] AI-Resume-Evolver v2.7 启动中...")
+    """应用生命周期：启动时预热 ChromaDB + MemorySaver，关闭时清理"""
+    print("[server] AI-Resume-Evolver v3.0 启动中...")
+    print("[server] MemorySaver 断点续传已挂载到共享图实例")
     print("[server] 预热 ChromaDB 连接...")
     try:
         from src.config import get_vector_db_client, get_collection_name
@@ -104,8 +116,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AI-Resume-Evolver API",
-    description="AI 简历智能优化引擎 —— 一键生成 + 多智能体博弈 + MockInterviewer 压测",
-    version="2.7.0",
+    description="AI 简历智能优化引擎 —— 一键生成 + 多智能体博弈 + MockInterviewer 压测 + 多轮交互",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -123,15 +135,18 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "version": "2.7.0", "service": "AI-Resume-Evolver"}
+    return {"status": "ok", "version": "3.0.0", "service": "AI-Resume-Evolver"}
 
 
 # ── SSE 流式管道 ──
 
-async def _stream_pipeline(initial_state: dict):
+async def _stream_pipeline(initial_state: dict, thread_id: str = ""):
     """
     SSE 事件流生成器 —— 在 ThreadPoolExecutor 中运行 LangGraph 全链路，
     通过 asyncio.Queue 桥接同步图执行与异步 SSE 推送。
+
+    使用应用级共享图 _app_graph，通过 thread_id 启用 MemorySaver 断点续传。
+    一键模式初始 user_supplement 为空，entry_router 自动走 retriever 全链路。
 
     事件序列:
       1. radar_init:   初筛完成 → 原始简历 6-3-1 雷达指标
@@ -140,14 +155,14 @@ async def _stream_pipeline(initial_state: dict):
       4. done:          流结束
       5. error:         异常（如有）
     """
-    app_graph = build_graph()
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
+    config = {"configurable": {"thread_id": thread_id}} if thread_id else {}
 
     def _run_graph():
         """在子线程中同步执行 LangGraph stream，将每次状态快照推入队列"""
         try:
-            for state in app_graph.stream(initial_state, stream_mode="values"):
+            for state in _app_graph.stream(initial_state, config=config, stream_mode="values"):
                 loop.call_soon_threadsafe(queue.put_nowait, ("state", state))
             loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
         except Exception as e:
@@ -249,12 +264,13 @@ async def _stream_pipeline(initial_state: dict):
                 "eval_dimensions": eval_dims,
                 "optimization_summary": final_state.get("optimization_summary", ""),
                 "clean_resume_json": final_state.get("clean_resume_json", {}),
+                "session_id": thread_id,
             })
             print(f"[sse] 分帧3 final: 终评 {eval_score}/100, 压测题 {len(questions)} 道, "
                   f"提升 +{eval_score - pre_total if pre_total > 0 else 'N/A'} 分")
 
         yield _sse_event("done", {})
-        print("[sse] 流式推送完成 (4/4 帧已全部发送)")
+        print(f"[sse] 流式推送完成 (4/4 帧已全部发送), thread_id={thread_id}")
 
 
 # ── 核心路由：简历优化 ──
@@ -271,22 +287,18 @@ async def optimize_resume(request: ResumeOptimizeRequest):
     |--------|----------|-----------|
     | `radar_init` | PreEvaluator 初筛完成 | `original_resume_radar`: 原始简历 6-3-1 雷达指标，前端渲染初始雷达图 |
     | `resume_stream` | Editor 精修完成 | `optimized_resume_text`: 精修后完整简历文本，前端打字机渐进显示 |
-    | `final` | Evaluator+Interviewer 完成 | `optimized_resume_radar`: 终评雷达, `stress_test_questions`: 3 道面试压测题, `score_improvement`: 提升分, `internal_monologue`: 毒舌批评 |
+    | `final` | Evaluator+Interviewer 完成 | `optimized_resume_radar`: 终评雷达, `stress_test_questions`: 3 道面试压测题, `score_improvement`: 提升分, `internal_monologue`: 毒舌批评, `session_id`: 会话 ID 供后续 chat 续接 |
     | `done` | 流正常结束 | 空 JSON `{}`，前端关闭 EventSource |
     | `error` | 异常中断 | `error`: 异常信息，随后推送 `done` 关闭流 |
 
-    **INTERACTIVE 模式**: 返回 HTTP 501 Not Implemented。
+    **INTERACTIVE 模式**: 已并网！前端应在拿到 session_id 后，通过 /api/v1/resume/chat 发起多轮补充。
+    此端点返回的 final 帧中包含 session_id，前端需保存该 ID 用于后续 chat 调用。
     """
-    # ── 交互模式预留 ──
-    if request.mode == OptimizeMode.INTERACTIVE:
-        raise HTTPException(
-            status_code=501,
-            detail="对话式深度访谈模式正在研发中，当前请使用一键极速优化模式（one_click）。"
-        )
+    # ── 会话隔离：优先使用前端传入的 session_id，否则自动生成 UUID ──
+    thread_id = request.session_id or str(uuid.uuid4())
 
-    # ── 一键生成模式 (SSE 流式) ──
-    print(f"\n[api] 收到一键优化请求: 简历 {len(request.resume_text)} 字符, "
-          f"JD {len(request.jd_text)} 字符")
+    print(f"\n[api] 收到优化请求 [{request.mode.value}]: 简历 {len(request.resume_text)} 字符, "
+          f"JD {len(request.jd_text)} 字符, session_id={thread_id}")
 
     initial_state = {
         "resume": request.resume_text,
@@ -305,10 +317,14 @@ async def optimize_resume(request: ResumeOptimizeRequest):
         "stress_test_questions": [],
         "optimization_summary": "",
         "clean_resume_json": {},
+        "chat_history": [],
+        "user_supplement": "",
+        "session_id": "",      # 一键模式不注入 session_id，eval_condition 走正常分诊
+        "turn_count": 0,
     }
 
     return StreamingResponse(
-        _stream_pipeline(initial_state),
+        _stream_pipeline(initial_state, thread_id=thread_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -318,11 +334,151 @@ async def optimize_resume(request: ResumeOptimizeRequest):
     )
 
 
-# ── 直接启动入口 ──
+# ── 交互模式 SSE 流式管道 ──
+
+async def _stream_chat_pipeline(thread_id: str, user_message: str):
+    """
+    交互模式 SSE 事件流生成器 —— 接收用户补充信息，通过共享图 _app_graph
+    在已有 session 的 checkpoint 上续跑，走 chat_editor → evaluator 闭环。
+
+    事件序列:
+      1. status:       chat_editor 完成 → node_status 状态帧
+      2. resume_stream: 更新后的简历全文 (含 node_status)
+      3. final:         Evaluator 评分 + Interviewer 压测题
+      4. done:          流结束
+      5. error:         异常（如有）
+    """
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    config = {"configurable": {"thread_id": thread_id}}
+
+    initial_input = {
+        "user_supplement": user_message,
+        "session_id": thread_id,  # 注入 session_id 以激活交互模式路由
+    }
+
+    print(f"[chat_sse] 启动交互流: thread_id={thread_id}, "
+          f"user_message={len(user_message)} 字符")
+
+    def _run_graph():
+        try:
+            for state in _app_graph.stream(initial_input, config=config, stream_mode="values"):
+                loop.call_soon_threadsafe(queue.put_nowait, ("state", state))
+            loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+        except Exception as e:
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", e))
+
+    final_state = None
+    last_resume_len = 0
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(_run_graph)
+
+        while True:
+            status, value = await queue.get()
+
+            if status == "error":
+                traceback.print_exc()
+                yield _sse_event("error", {
+                    "error": f"{type(value).__name__}: {str(value)[:200]}"
+                })
+                yield _sse_event("done", {})
+                return
+
+            if status == "done":
+                break
+
+            state = value
+            final_state = state
+
+            # ── 帧: node_status 状态推送 (对齐前端 status case) ──
+            node_status = state.get("node_status", "")
+            if node_status:
+                yield _sse_event("status", {
+                    "node_status": node_status,
+                    "turn_count": state.get("turn_count", 0),
+                })
+                print(f"[chat_sse] status: {node_status[:80]}...")
+
+            # ── 帧: 简历文本变更推送 (对齐前端 resume_stream case) ──
+            revised = state.get("revised_resume", "")
+            if revised and len(revised) != last_resume_len:
+                last_resume_len = len(revised)
+                yield _sse_event("resume_stream", {
+                    "optimized_resume_text": revised,
+                    "text_length": len(revised),
+                    "turn_count": state.get("turn_count", 0),
+                    "node_status": node_status or "",
+                })
+                print(f"[chat_sse] resume_stream: {len(revised)} 字符")
+
+        # ── 终帧: 评分 + 压测题 ──
+        if final_state:
+            eval_dims = final_state.get("eval_dimensions", {})
+            eval_score = final_state.get("score", 0)
+            opt_radar = _build_radar(eval_dims, eval_score)
+
+            questions = _build_stress_questions(
+                final_state.get("stress_test_questions", [])
+            )
+
+            yield _sse_event("final", {
+                "optimized_resume_radar": {
+                    "jd_matching_score": opt_radar.jd_matching_score if opt_radar else 0,
+                    "star_perf_score": opt_radar.star_perf_score if opt_radar else 0,
+                    "action_verbs_score": opt_radar.action_verbs_score if opt_radar else 0,
+                    "total_score": opt_radar.total_score if opt_radar else eval_score,
+                },
+                "optimized_resume_text": final_state.get("revised_resume", ""),
+                "stress_test_questions": questions,
+                "difficulty_flag": final_state.get("difficulty_flag", ""),
+                "turn_count": final_state.get("turn_count", 0),
+                "internal_monologue": final_state.get("internal_monologue", ""),
+                "session_id": thread_id,
+            })
+            print(f"[chat_sse] final: 终评 {eval_score}/100, "
+                  f"轮次 {final_state.get('turn_count', 0)}, 压测题 {len(questions)} 道")
+
+        yield _sse_event("done", {})
+        print(f"[chat_sse] 交互流推送完成, thread_id={thread_id}")
+
+
+# ── 交互模式路由：多轮对话 ──
+
+@app.post("/api/v1/resume/chat")
+async def chat_resume(request: ChatRequest):
+    """
+    多轮对话交互编辑接口 —— SSE 流式事件推送。
+
+    前端需先通过 /api/v1/resume/optimize 获取 session_id，
+    再将该 session_id 作为 thread_id 传入本端点进行多轮补充。
+
+    **事件帧序列**:
+
+    | 事件名 | 触发时机 | data 负载 |
+    |--------|----------|-----------|
+    | `status` | 节点状态变更 | `node_status`: 当前阶段描述, `turn_count`: 当前轮次 |
+    | `resume_stream` | chat_editor 完成增量编辑 | `optimized_resume_text`: 更新后简历全文, `text_length`: 字符数, `node_status`: 状态信息 |
+    | `final` | Evaluator+Interviewer 完成 | `optimized_resume_radar`: 终评雷达, `stress_test_questions`: 压测题, `turn_count`: 总轮次 |
+    | `done` | 流正常结束 | 空 JSON `{}` |
+    | `error` | 异常中断 | `error`: 异常信息 |
+    """
+    print(f"\n[api] 收到交互补充请求: thread_id={request.thread_id}, "
+          f"message={len(request.user_message)} 字符")
+
+    return StreamingResponse(
+        _stream_chat_pipeline(request.thread_id, request.user_message),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 if __name__ == "__main__":
     import uvicorn
-    print("启动 AI-Resume-Evolver FastAPI 服务...")
+    print("启动 AI-Resume-Evolver FastAPI 服务 v3.0 (双模拓扑 + MemorySaver)...")
     uvicorn.run(
         "main:app",
         host="127.0.0.1",       # v2.6: 死锁 127.0.0.1，根除 Windows 0.0.0.0 解析冲突
