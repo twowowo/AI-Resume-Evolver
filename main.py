@@ -35,7 +35,12 @@ import traceback
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, HTTPException
+import base64
+import io
+import tempfile
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -46,6 +51,7 @@ from src.schemas.resume import (
     ChatRequest,
 )
 from src.graph import build_graph
+from src.routes.agent_router import router as agent_router
 from langgraph.checkpoint.memory import MemorySaver
 
 # ── 启动时加载 .env ──
@@ -475,6 +481,130 @@ async def chat_resume(request: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+# ── 多模态文件上传解析端点 ──
+
+@app.post("/api/v1/upload/parse")
+async def upload_and_parse(file: UploadFile = File(...)):
+    """
+    文件/截屏上传解析端点 —— 支持 PDF/DOCX/TXT 文件物理去噪 + 图片多模态 Vision OCR。
+
+    **支持的文件类型**:
+    - `.pdf`  → pypdf 逐页提取文本
+    - `.docx` → docx2txt 结构化文本提取
+    - `.txt` / `.md` → 直接 UTF-8 读取
+    - `.png` / `.jpg` / `.jpeg` / `.webp` / `.gif` / `.bmp` → DeepSeek Vision 多模态 OCR
+
+    **响应体**:
+    ```json
+    {"success": true, "text": "提取的纯文本", "file_type": "pdf|docx|txt|image", "filename": "原始文件名"}
+    ```
+    """
+    filename = file.filename or "unknown"
+    ext = Path(filename).suffix.lower()
+
+    # 文件大小安全校验：上限 20MB
+    MAX_SIZE = 20 * 1024 * 1024
+    raw_bytes = await file.read()
+    if len(raw_bytes) > MAX_SIZE:
+        raise HTTPException(status_code=413, detail="文件过大，请上传 20MB 以内的文件")
+    if len(raw_bytes) == 0:
+        raise HTTPException(status_code=400, detail="文件为空，请重新选择文件")
+
+    print(f"[upload] 收到上传文件: {filename} ({len(raw_bytes)} bytes, type={ext})")
+
+    try:
+        # ── 纯文本类 ──
+        if ext in (".txt", ".md"):
+            text = raw_bytes.decode("utf-8").strip()
+            print(f"[upload] TXT 解析完成: {len(text)} 字符")
+            return {"success": True, "text": text, "file_type": "txt", "filename": filename}
+
+        # ── PDF ──
+        if ext == ".pdf":
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(raw_bytes))
+            pages: list[str] = []
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    pages.append(page_text)
+            text = "\n".join(pages).strip()
+            if not text:
+                raise HTTPException(status_code=422, detail="PDF 无法提取文本，可能是扫描件或图片型 PDF，请尝试截图后用图片上传")
+            print(f"[upload] PDF 解析完成: {len(text)} 字符, {len(pages)} 页")
+            return {"success": True, "text": text, "file_type": "pdf", "filename": filename}
+
+        # ── DOCX ──
+        if ext == ".docx":
+            import docx2txt
+
+            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+                tmp.write(raw_bytes)
+                tmp_path = tmp.name
+            try:
+                text = docx2txt.process(tmp_path)
+                text = (text or "").strip()
+            finally:
+                os.unlink(tmp_path)
+            if not text:
+                raise HTTPException(status_code=422, detail="DOCX 文件无法提取文本，请检查文件内容")
+            print(f"[upload] DOCX 解析完成: {len(text)} 字符")
+            return {"success": True, "text": text, "file_type": "docx", "filename": filename}
+
+        # ── 图片 / 截屏 ──
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"):
+            mime_map = {
+                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+            }
+            mime = mime_map.get(ext, "image/png")
+            image_b64 = base64.b64encode(raw_bytes).decode("utf-8")
+
+            from src.utils.llm import get_flash_client
+            from langchain_core.messages import HumanMessage
+
+            print(f"[upload] 启动 Vision OCR: {filename} ({mime})")
+            client = get_flash_client()
+            vision_message = HumanMessage(content=[
+                {
+                    "type": "text",
+                    "text": (
+                        "请将这张图片/截屏中包含的所有文字内容，一字不差地、以干净的排版提取并转化为纯文本返回。"
+                        "如果是简历内容，请保留原始格式、层级结构（工作经历、教育背景、技能等）和所有量化数据。"
+                        "如果是岗位 JD，请完整提取所有技术栈、职责描述、任职要求。"
+                        "只返回提取的文本内容，不要添加任何解释、评价或补充说明。"
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{image_b64}"},
+                },
+            ])
+
+            response = client.invoke([vision_message])
+            text = (response.content or "").strip()
+            if not text:
+                raise HTTPException(status_code=422, detail="图片中未识别到文字内容，请确认图片包含清晰的简历或 JD 文字")
+            print(f"[upload] Vision OCR 完成: {len(text)} 字符")
+            return {"success": True, "text": text, "file_type": "image", "filename": filename}
+
+        # ── 不支持的类型 ──
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件类型 ({ext})，请上传 PDF、DOCX、TXT 或图片（PNG/JPG/WEBP/BMP）",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"文件解析失败: {str(e)[:200]}")
+
+
+# ── Agent 模式路由：LangGraph ReAct 中央大脑 SSE 流式端点 ──
+app.include_router(agent_router)
 
 if __name__ == "__main__":
     import uvicorn
