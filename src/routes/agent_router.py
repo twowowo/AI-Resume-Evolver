@@ -81,8 +81,13 @@ async def stream_agent_brain(payload: AgentChatInput):
 
     config = {"configurable": {"thread_id": f"sse_session_{payload.user_id}"}}
 
-    # 3. SSE 生成器 — 流式挤出节点变更日志
+    # 3. SSE 生成器 — 流式挤出节点变更日志（内嵌流式安全熔断器）
     async def event_generator():
+        # ── 流式安全熔断器：单轮累计字符计数器 ──
+        total_streamed_chars = 0
+        MAX_CHARS = 12_000
+        circuit_breached = False
+
         try:
             yield ("data: " + json.dumps({
                 "event": "START",
@@ -90,6 +95,9 @@ async def stream_agent_brain(payload: AgentChatInput):
             }, ensure_ascii=False) + "\n\n")
 
             async for event in agent_compiled_graph.astream(initial_state, config):
+                if circuit_breached:
+                    break
+
                 for node_name, node_output in event.items():
                     payload_data = {
                         "node_name": node_name,
@@ -109,15 +117,46 @@ async def stream_agent_brain(payload: AgentChatInput):
                         else:
                             content = last_msg.content
                             if isinstance(content, str):
-                                payload_data["content"] = content[:800]
+                                payload_data["content"] = content
+                                # ── 流式字符计数累加 ──
+                                total_streamed_chars += len(content)
                             else:
                                 payload_data["content"] = str(content)
+                                total_streamed_chars += len(str(content))
 
                     yield ("data: " + json.dumps({
                         "event": "NODE_CHANGED",
                         "data": payload_data,
                     }, ensure_ascii=False) + "\n\n")
                     await asyncio.sleep(0.05)
+
+                    # ── 熔断判定：超过安全阈值立即斩断循环 ──
+                    if total_streamed_chars > MAX_CHARS:
+                        logger.warning(
+                            f"[AgentSSE] 流式安全熔断器触发！"
+                            f"累计 {total_streamed_chars} 字符 > {MAX_CHARS} 阈值，强制截断。"
+                        )
+                        circuit_breached = True
+                        break
+
+                if circuit_breached:
+                    break
+
+            if circuit_breached:
+                yield ("data: " + json.dumps({
+                    "event": "NODE_CHANGED",
+                    "data": {
+                        "node_name": "circuit_breaker",
+                        "msg_type": "SystemNotification",
+                        "content": (
+                            "\n\n⚠️ [SYSTEM NOTIFICATION: TRIGGERED STREAMING SAFETY "
+                            "CIRCUIT BREAKER (MAX CHARS EXCEEDED)]\n\n"
+                            f"单轮累计输出 {total_streamed_chars} 字符，已超过 {MAX_CHARS} "
+                            "字符安全阈值。流式管道已主动熔断，防止模型幻觉死循环无限喷射。"
+                            "\n请精简提问或分步执行。"
+                        ),
+                    },
+                }, ensure_ascii=False) + "\n\n")
 
             yield ("data: " + json.dumps({
                 "event": "END",

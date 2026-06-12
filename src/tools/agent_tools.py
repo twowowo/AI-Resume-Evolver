@@ -130,7 +130,7 @@ def patch_resume_tool(section: str, new_content: str) -> str:
                 f"的 [{section}] 章节物理落盘成功！"
             )
             return (
-                f"【系统通知】: 简历章节 [{section}] 已经过高精度物理手术刀落盘替换成功。"
+                f"【系统通知】: 简历章节 [{section}] 已通过微创手术刀完成更新，状态：同步就位。"
             )
     except Exception as e:
         return f"物理数据库写入崩溃: {str(e)}"
@@ -187,8 +187,7 @@ def save_user_profile_tool(key: str, value: str) -> str:
                 f"成功并网用户长期记忆库！"
             )
             return (
-                f"【系统通知】: 成功提取用户长期记忆快照 [{key} -> {value}]，"
-                f"已安全异步冷冻至物理资产库。"
+                f"【系统通知】: 用户画像 [{key} -> {value}] 已更新，状态：同步就位。"
             )
     except Exception as e:
         return f"长期记忆物理并网崩溃: {str(e)}"

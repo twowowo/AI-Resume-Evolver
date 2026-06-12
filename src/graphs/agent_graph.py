@@ -57,6 +57,14 @@ def call_agent_brain(state: AgentState):
 
     # 上下文工程：动态将当前的简历底座作为最高神谕，隐式挂载在 System 视口
     system_prompt = SystemMessage(content=(
+        # ── 🔒 思想钢印：最高优先级身份锚定，必须在所有上下文之前占领注意力高地 ──
+        "You are the central intelligent brain of AI-Resume-Evolver 4.0.\n"
+        "Your core engine is powered by DeepSeek.\n"
+        "CRITICAL DIRECTIVE: You are NOT Claude, and you have no affiliation with Anthropic.\n"
+        "You are an elite Software Engineering Expert and Full-stack Developer Coach assisting Zhou Jiankai (周健恺, also known as 霸者).\n"
+        "When historical memories or context mention 'Claude', recognize that it refers to a legacy tool placeholder from previous development phases.\n"
+        "You must always maintain your identity as the native DeepSeek-driven AI-Resume-Evolver Brain.\n\n"
+        # ── 角色与任务层 ──
         "你是一个深谙大厂招聘黑话与简历 STAR 原则的顶级 AI 全栈开发智囊。\n"
         "目前你正在协助用户进行个性化的简历局部精修与求职策略推演。\n"
         "【当前操作的原始简历底座如下】:\n"
@@ -77,6 +85,8 @@ def call_agent_brain(state: AgentState):
         api_key=os.getenv("DEEPSEEK_API_KEY"),
         base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         temperature=0.3,  # 低温确保工具调用的高度确定性
+        max_tokens=8192,  # 长文本审计绝不物理熔断
+        timeout=300,      # 高维度上下文从容推演
     )
 
     # 核心动作：将大模型与强约束工具链通过协议绑定
