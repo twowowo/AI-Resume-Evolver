@@ -2,9 +2,18 @@
 .env
 __pycache__/
 *.pyc
+# 系统临时文件
 .DS_Store
+*.log
 vector_db/
 output/
 data/resumes/~$*
 *.txt
 !data/reference/*.txt
+chroma_db/
+
+# 前端依赖，严禁入库
+frontend/node_modules/
+frontend/.next/
+frontend/dist/
+frontend/out/
