@@ -26,6 +26,8 @@ v3.0 更新:
 """
 #uvicorn main:app --host 127.0.0.1 --port 8001 --reload
 #npm run dev
+#taskkill /f /im python.exe
+#taskkill /f /im node.exe
 import json
 import os
 import sys
@@ -35,7 +37,6 @@ import traceback
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 
-import base64
 import io
 import tempfile
 from pathlib import Path
@@ -104,15 +105,20 @@ def _build_stress_questions(raw_questions: list) -> list[dict]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动时预热 ChromaDB + MemorySaver，关闭时清理"""
-    print("[server] AI-Resume-Evolver v3.0 启动中...")
+    print("[server] AI-Resume-Evolver v4.1 启动中...")
     print("[server] MemorySaver 断点续传已挂载到共享图实例")
-    print("[server] 预热 ChromaDB 连接...")
+    print("[server] 预热 ChromaDB 连接 + 种子数据守卫...")
     try:
-        from src.config import get_vector_db_client, get_collection_name
+        from src.config import get_vector_db_client, get_collection_name, ensure_seed_data
+        # ── v4.1 种子数据守卫：空库自动灌入金牌案例 ──
+        seeded = ensure_seed_data()
+        if seeded > 0:
+            print(f"[server] 🛡️ 种子数据守卫已激活：自动灌入 {seeded} 条金牌案例")
+        # 二次确认库状态
         client = get_vector_db_client()
-        collection = client.get_collection(name=get_collection_name())
+        collection = client.get_or_create_collection(name=get_collection_name())
         count = collection.count()
-        print(f"[server] ChromaDB 就绪，共 {count} 条向量")
+        print(f"[server] ChromaDB 就绪，Collection '{get_collection_name()}' 共 {count} 条向量")
     except Exception as e:
         print(f"[server] ChromaDB 预热失败（非致命）: {e}")
     print("[server] 服务已就绪，接受请求。")
@@ -553,41 +559,16 @@ async def upload_and_parse(file: UploadFile = File(...)):
             print(f"[upload] DOCX 解析完成: {len(text)} 字符")
             return {"success": True, "text": text, "file_type": "docx", "filename": filename}
 
-        # ── 图片 / 截屏 ──
+        # ── 图片 / 截屏（v4.1 视觉降级：本地 OCR 引擎，彻底封杀 image_url 400 报错）──
         if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"):
-            mime_map = {
-                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
-            }
-            mime = mime_map.get(ext, "image/png")
-            image_b64 = base64.b64encode(raw_bytes).decode("utf-8")
+            from src.utils.visual_processor import local_ocr_analyze
 
-            from src.utils.llm import get_flash_client
-            from langchain_core.messages import HumanMessage
-
-            print(f"[upload] 启动 Vision OCR: {filename} ({mime})")
-            client = get_flash_client()
-            vision_message = HumanMessage(content=[
-                {
-                    "type": "text",
-                    "text": (
-                        "请将这张图片/截屏中包含的所有文字内容，一字不差地、以干净的排版提取并转化为纯文本返回。"
-                        "如果是简历内容，请保留原始格式、层级结构（工作经历、教育背景、技能等）和所有量化数据。"
-                        "如果是岗位 JD，请完整提取所有技术栈、职责描述、任职要求。"
-                        "只返回提取的文本内容，不要添加任何解释、评价或补充说明。"
-                    ),
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{image_b64}"},
-                },
-            ])
-
-            response = client.invoke([vision_message])
-            text = (response.content or "").strip()
+            print(f"[upload] 启动本地 OCR: {filename} ({len(raw_bytes)} bytes)")
+            text = local_ocr_analyze(raw_bytes)
+            text = (text or "").strip()
             if not text:
                 raise HTTPException(status_code=422, detail="图片中未识别到文字内容，请确认图片包含清晰的简历或 JD 文字")
-            print(f"[upload] Vision OCR 完成: {len(text)} 字符")
+            print(f"[upload] 本地 OCR 完成: {len(text)} 字符")
             return {"success": True, "text": text, "file_type": "image", "filename": filename}
 
         # ── 不支持的类型 ──

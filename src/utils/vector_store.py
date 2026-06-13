@@ -8,9 +8,7 @@ from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
 
-COLLECTION_NAME = "resume_evolution_v1"
-CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "chroma_db")
-CHROMA_PERSIST_DIR = os.path.abspath(CHROMA_PERSIST_DIR)
+from src.config import CHROMA_PERSIST_DIR, COLLECTION_NAME
 
 _embedding_model = None
 _vector_store = None
@@ -40,12 +38,15 @@ def get_vector_store() -> Chroma:
     global _vector_store
     if _vector_store is None:
         os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
-        print(f"[vector_store] 本地 ChromaDB 路径: {CHROMA_PERSIST_DIR}")
+        print(f"[vector_store] 本地 ChromaDB 持久化路径 (来自 config 锁): {CHROMA_PERSIST_DIR}")
 
         client = chromadb.PersistentClient(
             path=CHROMA_PERSIST_DIR,
             settings=Settings(anonymized_telemetry=False),
         )
+
+        # v4.1: 始终使用 get_or_create 确保 collection 物理存在
+        client.get_or_create_collection(name=COLLECTION_NAME)
 
         _vector_store = Chroma(
             client=client,

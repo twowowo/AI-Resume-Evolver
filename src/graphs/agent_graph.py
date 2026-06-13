@@ -26,6 +26,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
 
 # 导入步骤1中通过20项压测的完全体武器库
 from src.tools.agent_tools import AGENT_TOOLS
@@ -79,20 +80,18 @@ def call_agent_brain(state: AgentState):
     # 组装当前的完整输入链
     full_messages = [system_prompt] + messages
 
-    # 初始化大模型并绑定武器库协议（Function Calling 关键动作）
-    llm = ChatOpenAI(
-        model=os.getenv("MODEL_FLASH", "deepseek-v4-flash"),
-        api_key=os.getenv("DEEPSEEK_API_KEY"),
-        base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        temperature=0.3,  # 低温确保工具调用的高度确定性
-        max_tokens=8192,  # 长文本审计绝不物理熔断
-        timeout=300,      # 高维度上下文从容推演
-    )
+    # v4.1 双模供给器：云端 DeepSeek 主线 (timeout=30s) + 自动降级本地 gemma3:1b
+    from src.utils.llm import get_resilient_llm
+    llm = get_resilient_llm(temperature=0.3, max_tokens=8192)
 
-    # 核心动作：将大模型与强约束工具链通过协议绑定
-    llm_with_tools = llm.bind_tools(AGENT_TOOLS)
+    # 核心动作：云端绑工具链，本地备胎纯文本模式（gemma3:1b 不支持 Function Calling）
+    if getattr(llm, "_is_fallback", False):
+        llm_with_tools = llm  # 本地备胎：禁止 bind_tools，纯文本轻装上阵
+    else:
+        llm_with_tools = llm.bind_tools(AGENT_TOOLS)
 
     # 触发模型推理
+    print("[AgentBrain] 🧠 LLM正在思考，请稍等十来秒...")
     response = llm_with_tools.invoke(full_messages)
 
     # 返回增量状态，LangGraph 会自动将其 merge 进状态机
@@ -144,5 +143,6 @@ workflow.add_conditional_edges(
 # 构成了 ReAct 的无限思考环路
 workflow.add_edge("tools_executor", "agent_brain")
 
-# 编译点火：产出最终的生产级可运行图单例
-agent_compiled_graph = workflow.compile()
+# ── v4.1 MemorySaver 状态机持久化：强制注入 Checkpointer 内存持久化锁 ──
+memory = MemorySaver()
+agent_compiled_graph = workflow.compile(checkpointer=memory)

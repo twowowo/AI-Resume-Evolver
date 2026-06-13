@@ -13,6 +13,7 @@ Agent 模式 SSE 流式长连接端点 — LangGraph ReAct 大脑对外暴露路
 import json
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -25,6 +26,9 @@ from src.database.models import UserResume
 
 logger = logging.getLogger("AgentRouter")
 logging.basicConfig(level=logging.INFO)
+
+# ── v4.1 全局专用线程池：物理抽离同步 DB I/O，释放 FastAPI 单线程事件循环十万并发带宽 ──
+db_executor = ThreadPoolExecutor(max_workers=10)
 
 router = APIRouter(prefix="/api/agent", tags=["AI Agent 中央大脑"])
 
@@ -61,12 +65,17 @@ def _build_resume_base(resume_record) -> str:
 async def stream_agent_brain(payload: AgentChatInput):
     """工业级 SSE 长连接流式端点 —— 将 LangGraph ReAct 环路逐帧催化至前端。"""
 
-    # 1. 从 MySQL 捞出该用户的最新简历底座
-    try:
+    # 1. v4.1 异步隔离：从 MySQL 捞出该用户的最新简历底座（线程池抽离同步阻塞）
+    def _fetch_resume_sync(user_id: str):
         with SessionLocal() as session:
-            stmt = select(UserResume).where(UserResume.user_id == payload.user_id)
-            resume_record = session.scalars(stmt).first()
-            current_resume_md = _build_resume_base(resume_record)
+            stmt = select(UserResume).where(UserResume.user_id == user_id)
+            return session.scalars(stmt).first()
+
+    try:
+        resume_record = await asyncio.get_event_loop().run_in_executor(
+            db_executor, _fetch_resume_sync, payload.user_id
+        )
+        current_resume_md = _build_resume_base(resume_record)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"物理存储底座读取故障: {str(e)}")
 
@@ -83,9 +92,11 @@ async def stream_agent_brain(payload: AgentChatInput):
 
     # 3. SSE 生成器 — 流式挤出节点变更日志（内嵌流式安全熔断器）
     async def event_generator():
-        # ── 流式安全熔断器：单轮累计字符计数器 ──
+        # ── v4.1 双重栅栏防爆熔断器：字符计数 + 工具调用次数并联 ──
         total_streamed_chars = 0
+        tool_call_count = 0
         MAX_CHARS = 12_000
+        MAX_TOOL_CALLS = 20
         circuit_breached = False
 
         try:
@@ -109,6 +120,7 @@ async def stream_agent_brain(payload: AgentChatInput):
                         payload_data["msg_type"] = type(last_msg).__name__
 
                         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                            tool_call_count += 1
                             payload_data["tool_calls"] = last_msg.tool_calls
                             payload_data["content"] = (
                                 f"大脑决定触发 Function Calling: "
@@ -130,11 +142,10 @@ async def stream_agent_brain(payload: AgentChatInput):
                     }, ensure_ascii=False) + "\n\n")
                     await asyncio.sleep(0.05)
 
-                    # ── 熔断判定：超过安全阈值立即斩断循环 ──
-                    if total_streamed_chars > MAX_CHARS:
+                    # ── v4.1 双重栅栏防爆：字符数或工具调用次数任一防线被击穿，立刻物理熔断降级 ──
+                    if total_streamed_chars > MAX_CHARS or tool_call_count > MAX_TOOL_CALLS:
                         logger.warning(
-                            f"[AgentSSE] 流式安全熔断器触发！"
-                            f"累计 {total_streamed_chars} 字符 > {MAX_CHARS} 阈值，强制截断。"
+                            f"[CIRCUIT BREAKER Triggered] Chars: {total_streamed_chars}, ToolCalls: {tool_call_count}"
                         )
                         circuit_breached = True
                         break
@@ -143,16 +154,30 @@ async def stream_agent_brain(payload: AgentChatInput):
                     break
 
             if circuit_breached:
+                breach_reason = ""
+                if total_streamed_chars > MAX_CHARS and tool_call_count > MAX_TOOL_CALLS:
+                    breach_reason = (
+                        f"双防线同时击穿！字符累计 {total_streamed_chars}/{MAX_CHARS} + "
+                        f"工具调用 {tool_call_count}/{MAX_TOOL_CALLS}"
+                    )
+                elif total_streamed_chars > MAX_CHARS:
+                    breach_reason = (
+                        f"字符洪峰防线击穿！累计 {total_streamed_chars}/{MAX_CHARS}"
+                    )
+                else:
+                    breach_reason = (
+                        f"工具调用狂潮防线击穿！累计 {tool_call_count}/{MAX_TOOL_CALLS}"
+                    )
                 yield ("data: " + json.dumps({
                     "event": "NODE_CHANGED",
                     "data": {
                         "node_name": "circuit_breaker",
                         "msg_type": "SystemNotification",
                         "content": (
-                            "\n\n⚠️ [SYSTEM NOTIFICATION: TRIGGERED STREAMING SAFETY "
-                            "CIRCUIT BREAKER (MAX CHARS EXCEEDED)]\n\n"
-                            f"单轮累计输出 {total_streamed_chars} 字符，已超过 {MAX_CHARS} "
-                            "字符安全阈值。流式管道已主动熔断，防止模型幻觉死循环无限喷射。"
+                            f"\n\n⚠️ [SYSTEM NOTIFICATION: TRIGGERED DUAL-GATE "
+                            f"CIRCUIT BREAKER]\n\n"
+                            f"{breach_reason}\n"
+                            "流式管道已主动熔断，防止模型幻觉死循环无限喷射。"
                             "\n请精简提问或分步执行。"
                         ),
                     },

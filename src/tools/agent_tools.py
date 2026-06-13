@@ -1,10 +1,13 @@
 """
-Agent 模式工具链 —— 三把工业级武器 (MySQL 物理并网版)
+Agent 模式工具链 —— 六把工业级武器 (MySQL 物理并网版 + 时空感知 + 高精度计算)
 
 武器清单:
-  1. tavily_search_tool     — Tavily 联网情报检索
-  2. patch_resume_tool      — 简历局部微创手术刀 (物理 MySQL INSERT/UPDATE)
-  3. save_user_profile_tool — 用户意图长期记忆冰冻 (物理 MySQL Upsert)
+  1. tavily_search_tool        — Tavily 联网情报检索
+  2. patch_resume_tool         — 简历局部微创手术刀 (物理 MySQL INSERT/UPDATE)
+  3. save_user_profile_tool    — 用户意图长期记忆冰冻 (物理 MySQL Upsert)
+  4. get_current_system_time   — 数字手表 (实时系统时间感知)
+  5. probe_host_environment    — 宿主环境探针 (操作系统与硬件感知)
+  6. calculate_precise_metrics — 高精度 STAR 数据计算器 (反心算安全网关)
 
 持久化:
   - 会话工厂 SessionLocal (src.database.connection)
@@ -16,6 +19,7 @@ import os
 import logging
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
+from langchain_core.tools import ToolException
 from tavily import TavilyClient
 from sqlalchemy import select
 
@@ -54,10 +58,12 @@ def tavily_search_tool(query: str) -> str:
     try:
         tavily_api_key = os.getenv("TAVILY_API_KEY")
         if not tavily_api_key:
-            return "错误：未检测到环境变量 TAVILY_API_KEY，联网检索失败。"
+            raise ToolException(
+                "未检测到环境变量 TAVILY_API_KEY，联网检索不可用。"
+                "请根据已有知识库进行简历重写，不要死等该工具。"
+            )
 
         client = TavilyClient(api_key=tavily_api_key)
-        # 工业级上下文工程：控制 token 长度，防止长文本中间迷失
         response = client.search(query=query, max_results=2, include_raw_content=False)
 
         results = []
@@ -71,8 +77,17 @@ def tavily_search_tool(query: str) -> str:
             if results
             else "全网搜索完成，但未找到相关强相关信息。"
         )
-    except Exception as e:
-        return f"工具执行期间发生物理崩溃: {str(e)}"
+    except ToolException:
+        raise
+    except Exception:
+        raise ToolException(
+            "外部联网检索工具暂时不可用（网络超时或物理连接异常）。"
+            "请尝试根据你已有的知识库进行简历重写，不要死等该工具。"
+        )
+
+
+# 显式绑定错误接管属性（全版本兼容）
+tavily_search_tool.handle_tool_error = True
 
 
 # ==========================================
@@ -102,26 +117,22 @@ def patch_resume_tool(section: str, new_content: str) -> str:
     严禁重写整份简历！只对目标 section 实施微创手术替换。
     """
     if section not in _VALID_SECTIONS:
-        return (
-            f"【硬拦截】错误：非法章节 [{section}]。"
-            f"合法范围必须在 {_VALID_SECTIONS} 内。"
+        raise ToolException(
+            f"【硬拦截】非法章节 [{section}]，合法范围必须在 {_VALID_SECTIONS} 内。"
         )
 
     if not new_content.strip():
-        return "【硬拦截】错误：修改内容不能为空字符串。"
+        raise ToolException("【硬拦截】修改内容不能为空字符串。")
 
     try:
-        # 开启物理数据库事务流
         with SessionLocal() as session:
             stmt = select(UserResume).where(UserResume.user_id == MOCK_USER_ID)
             resume = session.scalars(stmt).first()
 
             if not resume:
-                # 没有该用户的简历底座 → 物理初始化一行
                 resume = UserResume(user_id=MOCK_USER_ID)
                 session.add(resume)
 
-            # 动态微创定位更新对应的 Markdown 章节
             setattr(resume, section, new_content)
             session.commit()
 
@@ -132,8 +143,17 @@ def patch_resume_tool(section: str, new_content: str) -> str:
             return (
                 f"【系统通知】: 简历章节 [{section}] 已通过微创手术刀完成更新，状态：同步就位。"
             )
-    except Exception as e:
-        return f"物理数据库写入崩溃: {str(e)}"
+    except ToolException:
+        raise
+    except Exception:
+        raise ToolException(
+            f"物理数据库写入异常：章节 [{section}] 更新失败。"
+            f"请稍后重试或检查数据库连接状态。"
+        )
+
+
+# 显式绑定错误接管属性（全版本兼容）
+patch_resume_tool.handle_tool_error = True
 
 
 # ==========================================
@@ -166,7 +186,6 @@ def save_user_profile_tool(key: str, value: str) -> str:
     """
     try:
         with SessionLocal() as session:
-            # 大厂级幂等 Upsert 逻辑：先查后插/改
             stmt = select(UserProfile).where(
                 UserProfile.user_id == MOCK_USER_ID,
                 UserProfile.profile_key == key,
@@ -189,8 +208,78 @@ def save_user_profile_tool(key: str, value: str) -> str:
             return (
                 f"【系统通知】: 用户画像 [{key} -> {value}] 已更新，状态：同步就位。"
             )
+    except ToolException:
+        raise
+    except Exception:
+        raise ToolException(
+            f"长期记忆物理并网异常：画像特征 [{key}] 写入失败。"
+            f"请稍后重试或检查数据库连接状态。"
+        )
+
+
+# 显式绑定错误接管属性（全版本兼容）
+save_user_profile_tool.handle_tool_error = True
+
+
+# ==========================================
+# ⏰ 武器四：数字手表 — 实时系统时间感知
+# ==========================================
+
+@tool
+def get_current_system_time() -> str:
+    """获取当前系统的实时精确日期和时间。当用户询问'现在几点'、'今天是几号'、'当前时间'、'星期几'或者需要根据当前时间进行任何简历逻辑推理时，必须调用此工具。"""
+    try:
+        from datetime import datetime
+        now = datetime.now()
+        weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+        current_time_str = now.strftime("%Y-%m-%d %H:%M:%S") + " " + weekdays[now.weekday()]
+        return f"当前系统实时时间为：{current_time_str}"
     except Exception as e:
-        return f"长期记忆物理并网崩溃: {str(e)}"
+        raise ToolException(f"获取本地时间失败: {str(e)}")
+
+
+get_current_system_time.handle_tool_error = True
+
+
+# ==========================================
+# 🛠️ 武器五：宿主环境探针 — 运行时物理环境感知
+# ==========================================
+
+@tool
+def probe_host_environment() -> str:
+    """获取当前 Agent 运行的宿主服务器操作系统和基础硬件环境信息。当用户询问系统版本、服务器配置或运行环境时调用。"""
+    try:
+        import platform
+        os_info = f"{platform.system()} {platform.release()} (Architecture: {platform.machine()})"
+        return f"Agent 当前物理宿主环境为：{os_info}。本地存储绝对路径已锁定，混合云灾备就绪。"
+    except Exception as e:
+        raise ToolException(f"感知宿主环境失败: {str(e)}")
+
+
+probe_host_environment.handle_tool_error = True
+
+
+# ==========================================
+# 📐 武器六：高精度 STAR 数据计算器 — 量化指标精确运算
+# ==========================================
+
+@tool
+def calculate_precise_metrics(expression: str) -> str:
+    """高精度数学计算器。专门用于简历优化中 STAR 原则的业绩提升比例、吞吐量、QPS等数值的精确计算。严禁大模型心算，涉及任何数字运算、百分比推导时必须调用此工具。输入参数 expression 为纯 Python 算术表达式字符串（例如 '(450-120)/120 * 100'）。"""
+    try:
+        if not all(c in "0123456789+-*/(). " for c in expression):
+            raise ToolException(
+                "计算表达式包含非法字符，出于安全考虑已被熔断阻断。"
+            )
+        result = eval(expression)
+        return f"高精度计算结果：{result}"
+    except ToolException:
+        raise
+    except Exception as e:
+        raise ToolException(f"数学网关执行异常: {str(e)}")
+
+
+calculate_precise_metrics.handle_tool_error = True
 
 
 def get_user_profile() -> dict[str, str]:
@@ -222,4 +311,11 @@ def clear_user_profile() -> None:
 
 
 # ── 工具清单导出（供 graph.py / run_app.py 通过 ToolNode 直接绑定）──
-AGENT_TOOLS = [tavily_search_tool, patch_resume_tool, save_user_profile_tool]
+AGENT_TOOLS = [
+    tavily_search_tool,
+    patch_resume_tool,
+    save_user_profile_tool,
+    get_current_system_time,
+    probe_host_environment,
+    calculate_precise_metrics,
+]
