@@ -108,13 +108,26 @@ class PatchResumeInput(BaseModel):
             "经过大模型根据用户意见重组、包装后的该章节完整 Markdown 文本"
         ),
     )
+    evidence: str = Field(
+        default="",
+        description=(
+            "【Ragas 证据链锚定】本次修改的 JD 依据，必须明确指出 JD 中的哪个具体要求驱动了本次修改。"
+            "格式：'JD 要求: <具体JD条款> → 简历匹配: <对应修改内容摘要>'"
+        ),
+    )
+    jd_requirement: str = Field(
+        default="",
+        description="触发本次修改的 JD 原文关键句或技术要求，用于审计对账",
+    )
 
 
 @tool(args_schema=PatchResumeInput)
-def patch_resume_tool(section: str, new_content: str) -> str:
+def patch_resume_tool(section: str, new_content: str, evidence: str = "", jd_requirement: str = "") -> str:
     """
     当用户明确发出指令，要求修改、润色、或补充简历的某个特定部分时调用。
     严禁重写整份简历！只对目标 section 实施微创手术替换。
+
+    v4.6 Ragas 证据链锚定: 每次调用必须附带 evidence 参数，说明 JD 依据与简历修改的对应关系。
     """
     if section not in _VALID_SECTIONS:
         raise ToolException(
@@ -123,6 +136,16 @@ def patch_resume_tool(section: str, new_content: str) -> str:
 
     if not new_content.strip():
         raise ToolException("【硬拦截】修改内容不能为空字符串。")
+
+    # ── v4.6 证据链审计日志 ──
+    if evidence:
+        logger.info(
+            f"[Ragas 证据链] 章节 [{section}] 修改依据: {evidence[:300]}"
+        )
+    if jd_requirement:
+        logger.info(
+            f"[Ragas 证据锚点] 章节 [{section}] JD 原文锚点: {jd_requirement[:200]}"
+        )
 
     try:
         with SessionLocal() as session:
@@ -140,9 +163,24 @@ def patch_resume_tool(section: str, new_content: str) -> str:
                 f"[MySQL_UPDATE_SUCCESS] 用户 [{MOCK_USER_ID}] "
                 f"的 [{section}] 章节物理落盘成功！"
             )
-            return (
-                f"【系统通知】: 简历章节 [{section}] 已通过微创手术刀完成更新，状态：同步就位。"
-            )
+
+            # ── v4.6 引用式修改确认 ──
+            if evidence and jd_requirement:
+                return (
+                    f"依据 JD 中对【{jd_requirement[:120]}】的要求，"
+                    f"已在简历的【{section}】模块中进行了重构，"
+                    f"确保完全对齐该项招聘指标。\n"
+                    f"[证据链] {evidence}"
+                )
+            elif evidence:
+                return (
+                    f"【系统通知】: 简历章节 [{section}] 已通过微创手术刀完成更新。\n"
+                    f"[证据链] {evidence}"
+                )
+            else:
+                return (
+                    f"【系统通知】: 简历章节 [{section}] 已通过微创手术刀完成更新，状态：同步就位。"
+                )
     except ToolException:
         raise
     except Exception:

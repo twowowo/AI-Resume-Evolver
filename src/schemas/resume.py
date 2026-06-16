@@ -63,7 +63,7 @@ class OptimizeMode(str, Enum):
 # ── 请求体 ──
 
 class ResumeOptimizeRequest(BaseModel):
-    """简历优化统一请求体"""
+    """简历优化统一请求体 —— v4.2 多租户隔离沙箱"""
 
     resume_text: str = Field(
         ..., min_length=10, max_length=10000,
@@ -80,6 +80,14 @@ class ResumeOptimizeRequest(BaseModel):
     session_id: Optional[str] = Field(
         default=None,
         description="会话 ID (UUID)，用于交互模式断点续传。一键模式可选，服务端未传时自动生成"
+    )
+    user_id: str = Field(
+        default="default_user",
+        description="用户全局唯一 ID，贯穿全链路三层漏斗隔离"
+    )
+    resume_id: str = Field(
+        default="default_resume",
+        description="当前简历文件唯一 Hash 标识，锁死记忆沙箱边界"
     )
 
 

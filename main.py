@@ -53,6 +53,7 @@ from src.schemas.resume import (
 )
 from src.graph import build_graph
 from src.routes.agent_router import router as agent_router
+from src.nodes.visual_payload import compile_to_visual_payload
 from langgraph.checkpoint.memory import MemorySaver
 
 # ── 启动时加载 .env ──
@@ -98,6 +99,16 @@ def _build_stress_questions(raw_questions: list) -> list[dict]:
         except Exception as e:
             print(f"[api] 压测题解析失败: {e}")
     return result
+
+
+def _safe_list(dims: dict, key: str) -> list[str]:
+    """从 dimension_scores 字典安全提取列表字段并转字符串列表"""
+    val = dims.get(key, [])
+    if isinstance(val, list):
+        return [str(v) for v in val]
+    if isinstance(val, str):
+        return [val] if val else []
+    return []
 
 
 # ── FastAPI 应用工厂 ──
@@ -205,7 +216,7 @@ async def _stream_pipeline(initial_state: dict, thread_id: str = ""):
             state = value
             final_state = state
 
-            # ── 里程碑 1: PreEvaluator 完成 → 推送原始简历雷达 ──
+            # ── 里程碑 1: PreEvaluator 完成 → 推送原始简历雷达 + 诊断原文 ──
             if not yielded_radar and state.get("pre_eval_dimensions"):
                 yielded_radar = True
                 dims = state["pre_eval_dimensions"]
@@ -213,31 +224,49 @@ async def _stream_pipeline(initial_state: dict, thread_id: str = ""):
                 if pre_total == 0:
                     pre_total = state.get("score", 0)
                 radar = RadarMetrics.from_dimensions(dims, pre_total)
+
+                # ── v4.6 诊断原文：从 pre_eval_dimensions 提取结构化诊断数据 ──
+                diagnosis = {
+                    "feedback": state.get("evaluation_feedback", ""),
+                    "core_tool_overlap": state.get("node_status", ""),
+                    "matched_skills": _safe_list(dims, "matched_skills"),
+                    "missing_skills": _safe_list(dims, "missing_skills"),
+                    "star_strengths": _safe_list(dims, "star_strengths"),
+                    "star_weaknesses": _safe_list(dims, "star_weaknesses"),
+                    "weak_verbs": _safe_list(dims, "weak_verbs"),
+                }
+
                 yield _sse_event("radar_init", {
                     "original_resume_radar": {
                         "jd_matching_score": radar.jd_matching_score,
                         "star_perf_score": radar.star_perf_score,
                         "action_verbs_score": radar.action_verbs_score,
                         "total_score": radar.total_score,
-                    }
+                    },
+                    "diagnosis": diagnosis,
                 })
                 print(f"[sse] 分帧1 radar_init: 原始雷达 {pre_total}/100 "
                       f"(JD: {radar.jd_matching_score}/60, STAR: {radar.star_perf_score}/30, "
-                      f"Verb: {radar.action_verbs_score}/10)")
+                      f"Verb: {radar.action_verbs_score}/10) | "
+                      f"覆盖技能: {len(diagnosis['matched_skills'])}项, "
+                      f"缺失: {len(diagnosis['missing_skills'])}项")
 
-            # ── 里程碑 2: Editor 完成 → 推送精修简历文本 ──
+            # ── 里程碑 2: Editor 完成 → 推送精修简历文本 + 混合解耦载荷 ──
             if not yielded_resume and state.get("revised_resume"):
                 yielded_resume = True
                 revised = state["revised_resume"]
                 opt_summary = state.get("optimization_summary", "")
                 clean_json = state.get("clean_resume_json", {})
+                vp = compile_to_visual_payload(revised)
                 yield _sse_event("resume_stream", {
                     "optimized_resume_text": revised,
                     "text_length": len(revised),
                     "optimization_summary": opt_summary,
                     "clean_resume_json": clean_json,
+                    "visual_payload": vp,
                 })
                 print(f"[sse] 分帧2 resume_stream: 精修文本 {len(revised)} 字符, "
+                      f"skills={len(vp.get('skills', []))}项, "
                       f"summary {len(opt_summary)} 字符, json_keys {list(clean_json.keys()) if clean_json else '[]'}")
 
         # ── 里程碑 3: 全链路完成 → 推送终评雷达 + 压测题 ──
@@ -256,6 +285,8 @@ async def _stream_pipeline(initial_state: dict, thread_id: str = ""):
                          pre_eval_dims.get("verb_quality", 0))
 
             is_extreme_gap = final_state.get("difficulty_flag", "") == "EXTREME_GAP"
+            revised_final = final_state.get("revised_resume", "")
+            vp_final = compile_to_visual_payload(revised_final) if revised_final else {}
 
             yield _sse_event("final", {
                 "optimized_resume_radar": {
@@ -264,7 +295,7 @@ async def _stream_pipeline(initial_state: dict, thread_id: str = ""):
                     "action_verbs_score": opt_radar.action_verbs_score if opt_radar else 0,
                     "total_score": opt_radar.total_score if opt_radar else eval_score,
                 },
-                "optimized_resume_text": final_state.get("revised_resume", ""),
+                "optimized_resume_text": revised_final,
                 "stress_test_questions": questions,
                 "difficulty_flag": final_state.get("difficulty_flag", ""),
                 "is_extreme_gap": is_extreme_gap,
@@ -276,6 +307,7 @@ async def _stream_pipeline(initial_state: dict, thread_id: str = ""):
                 "eval_dimensions": eval_dims,
                 "optimization_summary": final_state.get("optimization_summary", ""),
                 "clean_resume_json": final_state.get("clean_resume_json", {}),
+                "visual_payload": vp_final,
                 "session_id": thread_id,
             })
             print(f"[sse] 分帧3 final: 终评 {eval_score}/100, 压测题 {len(questions)} 道, "
@@ -306,13 +338,18 @@ async def optimize_resume(request: ResumeOptimizeRequest):
     **INTERACTIVE 模式**: 已并网！前端应在拿到 session_id 后，通过 /api/v1/resume/chat 发起多轮补充。
     此端点返回的 final 帧中包含 session_id，前端需保存该 ID 用于后续 chat 调用。
     """
-    # ── 会话隔离：优先使用前端传入的 session_id，否则自动生成 UUID ──
-    thread_id = request.session_id or str(uuid.uuid4())
+    # ── v4.2 三层漏斗 Layer 1: 动态复合钥匙 f"{user_id}_{resume_id}" ──
+    user_id = request.user_id
+    resume_id = request.resume_id
+    thread_id = f"{user_id}::{resume_id}"
+    print(f"[记忆沙箱点火] 线程已锁定: {thread_id}")
 
     print(f"\n[api] 收到优化请求 [{request.mode.value}]: 简历 {len(request.resume_text)} 字符, "
-          f"JD {len(request.jd_text)} 字符, session_id={thread_id}")
+          f"JD {len(request.jd_text)} 字符, thread_id={thread_id}")
 
     initial_state = {
+        "user_id": user_id,
+        "resume_id": resume_id,
         "resume": request.resume_text,
         "jd": request.jd_text,
         "rag_context": "",
@@ -333,6 +370,8 @@ async def optimize_resume(request: ResumeOptimizeRequest):
         "user_supplement": "",
         "session_id": "",      # 一键模式不注入 session_id，eval_condition 走正常分诊
         "turn_count": 0,
+        "step_count": 0,
+        "total_tokens": 0,
     }
 
     return StreamingResponse(
@@ -367,8 +406,14 @@ async def _stream_chat_pipeline(thread_id: str, user_message: str):
     initial_input = {
         "user_supplement": user_message,
         "session_id": thread_id,  # 注入 session_id 以激活交互模式路由
+        # v4.2: 从复合钥匙中解包身份标识，注入状态机供 retriever 元数据过滤
+        "user_id": thread_id.split("::")[0] if "::" in thread_id else "default_user",
+        "resume_id": thread_id.split("::")[1] if "::" in thread_id else "default_resume",
+        "step_count": 0,
+        "total_tokens": 0,
     }
 
+    print(f"[记忆沙箱点火] 线程已锁定: {thread_id}")
     print(f"[chat_sse] 启动交互流: thread_id={thread_id}, "
           f"user_message={len(user_message)} 字符")
 
@@ -416,15 +461,18 @@ async def _stream_chat_pipeline(thread_id: str, user_message: str):
             revised = state.get("revised_resume", "")
             if revised and len(revised) != last_resume_len:
                 last_resume_len = len(revised)
+                vp = compile_to_visual_payload(revised)
                 yield _sse_event("resume_stream", {
                     "optimized_resume_text": revised,
                     "text_length": len(revised),
                     "turn_count": state.get("turn_count", 0),
                     "node_status": node_status or "",
+                    "visual_payload": vp,
                 })
-                print(f"[chat_sse] resume_stream: {len(revised)} 字符")
+                print(f"[chat_sse] resume_stream: {len(revised)} 字符, "
+                      f"skills={len(vp.get('skills', []))}项")
 
-        # ── 终帧: 评分 + 压测题 ──
+        # ── 终帧: 评分 + 压测题 + 混合解耦载荷 ──
         if final_state:
             eval_dims = final_state.get("eval_dimensions", {})
             eval_score = final_state.get("score", 0)
@@ -434,6 +482,9 @@ async def _stream_chat_pipeline(thread_id: str, user_message: str):
                 final_state.get("stress_test_questions", [])
             )
 
+            revised_final = final_state.get("revised_resume", "")
+            vp_final = compile_to_visual_payload(revised_final) if revised_final else {}
+
             yield _sse_event("final", {
                 "optimized_resume_radar": {
                     "jd_matching_score": opt_radar.jd_matching_score if opt_radar else 0,
@@ -441,14 +492,16 @@ async def _stream_chat_pipeline(thread_id: str, user_message: str):
                     "action_verbs_score": opt_radar.action_verbs_score if opt_radar else 0,
                     "total_score": opt_radar.total_score if opt_radar else eval_score,
                 },
-                "optimized_resume_text": final_state.get("revised_resume", ""),
+                "optimized_resume_text": revised_final,
                 "stress_test_questions": questions,
                 "difficulty_flag": final_state.get("difficulty_flag", ""),
                 "turn_count": final_state.get("turn_count", 0),
                 "internal_monologue": final_state.get("internal_monologue", ""),
+                "visual_payload": vp_final,
                 "session_id": thread_id,
             })
             print(f"[chat_sse] final: 终评 {eval_score}/100, "
+                  f"skills={len(vp_final.get('skills', []))}项, "
                   f"轮次 {final_state.get('turn_count', 0)}, 压测题 {len(questions)} 道")
 
         yield _sse_event("done", {})
@@ -499,7 +552,7 @@ async def upload_and_parse(file: UploadFile = File(...)):
     - `.pdf`  → pypdf 逐页提取文本
     - `.docx` → docx2txt 结构化文本提取
     - `.txt` / `.md` → 直接 UTF-8 读取
-    - `.png` / `.jpg` / `.jpeg` / `.webp` / `.gif` / `.bmp` → DeepSeek Vision 多模态 OCR
+    - `.png` / `.jpg` / `.jpeg` / `.webp` / `.gif` / `.bmp` → DeepSeek 多模态视觉解析
 
     **响应体**:
     ```json
@@ -559,16 +612,16 @@ async def upload_and_parse(file: UploadFile = File(...)):
             print(f"[upload] DOCX 解析完成: {len(text)} 字符")
             return {"success": True, "text": text, "file_type": "docx", "filename": filename}
 
-        # ── 图片 / 截屏（v4.1 视觉降级：本地 OCR 引擎，彻底封杀 image_url 400 报错）──
+        # ── 图片 / 截屏（v4.4：DeepSeek 多模态视觉 Context 注入，彻底淘汰 EasyOCR）──
         if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"):
-            from src.utils.visual_processor import local_ocr_analyze
+            from src.utils.visual_processor import parse_resume_image_via_vlm
 
-            print(f"[upload] 启动本地 OCR: {filename} ({len(raw_bytes)} bytes)")
-            text = local_ocr_analyze(raw_bytes)
+            print(f"[upload] 启动 DeepSeek 多模态视觉解析: {filename} ({len(raw_bytes)} bytes)")
+            text = await parse_resume_image_via_vlm(raw_bytes)
             text = (text or "").strip()
             if not text:
                 raise HTTPException(status_code=422, detail="图片中未识别到文字内容，请确认图片包含清晰的简历或 JD 文字")
-            print(f"[upload] 本地 OCR 完成: {len(text)} 字符")
+            print(f"[upload] DeepSeek 视觉解析完成: {len(text)} 字符")
             return {"success": True, "text": text, "file_type": "image", "filename": filename}
 
         # ── 不支持的类型 ──

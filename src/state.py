@@ -3,7 +3,12 @@ import operator
 
 
 class AgentState(TypedDict):
-    """v2.0 LangGraph 多智能体状态（run_app.py / graph.py 使用）"""
+    """v4.2 LangGraph 多智能体状态 —— 三层漏斗隔离沙箱"""
+
+    # ── v4.2 多租户隔离底座：动态 thread_id = f"{user_id}::{resume_id}" ──
+    user_id: str               # 用户全局唯一 ID，贯穿全链路隔离
+    resume_id: str             # 当前简历文件 Hash 标识，锁死记忆沙箱边界
+
     resume: str
     jd: str
     rag_context: str
@@ -26,7 +31,13 @@ class AgentState(TypedDict):
     optimization_summary: str   # editor 生成的简历优化说明综述（前端看板消费）
     clean_resume_json: dict     # editor 生成的结构化简历数据（前端 A4 纸消费）
     # 💬 v3.0 交互问答模式新增数据动线
-    chat_history: Annotated[List[dict], operator.add]  # 自动追加多轮 [User, AI] 对话历史
-    user_supplement: str       # 用户在左侧输入框最新敲入的补充信息/修改意见
-    session_id: str            # 会话 ID (UUID)，对应前端 thread_id
-    turn_count: int            # 对话轮数累加计数器
+    chat_history: list            # v4.5 降级为 plain list：由 summarize 节点物理瘦身替换
+    user_supplement: str          # 用户在左侧输入框最新敲入的补充信息/修改意见
+    session_id: str               # 会话 ID (UUID)，对应前端 thread_id
+    turn_count: int               # 对话轮数累加计数器
+    # ── v4.5 长对话熔断器：高保真记忆脱水缓存 ──
+    conversation_summary: str     # summarize_history_node 产出的结构化断点备忘录
+    visual_payload: dict          # v4.5 混合解耦载荷 (name/contact/skills[]/main_resume_markdown)
+    # ── v4.3 Ragas 影子审计提效计数器 ──
+    step_count: int            # LangGraph 节点迭代步数累计
+    total_tokens: int          # 累计消耗 Token（估算值）

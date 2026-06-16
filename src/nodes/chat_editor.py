@@ -21,6 +21,9 @@ _CLEAN_RESUME_RE = re.compile(
 CHAT_EDITOR_SYSTEM_PROMPT = """你是一位精通大模型工程化与简历重构的首席全栈专家。
 现在，用户正在针对当前的简历半成品提出进一步的修改意见或信息补充。
 
+【历史会话断点备忘录】
+{conversation_summary}
+
 【目标岗位 JD】
 {jd}
 
@@ -36,10 +39,17 @@ CHAT_EDITOR_SYSTEM_PROMPT = """你是一位精通大模型工程化与简历重�
 4. 三竖线拦截：任何新增或修改的经历头部，必须严格遵循 `时间段 | 机构名称 | 身份` 的格式。
 5. 量化优先：所有补充的新经历，必须包含可量化的指标或成果数据，严禁空洞描述。
 6. 全量输出：输出完整简历全文，不得截断或省略任何已有章节。
+7. 断点续传：请优先参考【历史会话断点备忘录】中的雷区限制与分数轨迹，避免重复踩坑。
+8. 【v4.6 Ragas 透明化前言】在 <clean_resume> 标签内的 Markdown 正文最开头（第一个 ## 标题之前），必须包含以下声明（使用 > 引用块格式）：
+> **已基于当前岗位 JD 需求完成简历的语义对齐与技术锚点强化，以下是根据您提供的原始项目文档及 JD 要求生成的终稿。**
+该声明绝不可省略。
 """
 
 CHAT_EDITOR_REFINE_PROMPT = """你是一位精通大模型工程化与简历重构的首席全栈专家。
 评审团刚刚对当前简历给出了评分和反馈，你需要根据反馈进行针对性打磨。
+
+【历史会话断点备忘录】
+{conversation_summary}
 
 【目标岗位 JD】
 {jd}
@@ -55,15 +65,22 @@ CHAT_EDITOR_REFINE_PROMPT = """你是一位精通大模型工程化与简历重�
 2. 物理隔离：必须将最终 Markdown 简历放置在 <clean_resume>...</clean_resume> 标签内。
 3. 三竖线拦截：任何修改的经历头部，必须严格遵循 `时间段 | 机构名称 | 身份` 的格式。
 4. 全量输出：输出完整简历全文，不得截断或省略任何已有章节。
+5. 断点续传：请优先参考【历史会话断点备忘录】中的雷区限制与分数轨迹，避免重复踩坑。
+6. 【v4.6 Ragas 透明化前言】在 <clean_resume> 标签内的 Markdown 正文最开头，必须包含以下声明：
+> **已基于当前岗位 JD 需求完成简历的语义对齐与技术锚点强化，以下是根据您提供的原始项目文档及 JD 要求生成的终稿。**
 """
 
 
 def chat_editor_node(state: AgentState) -> dict:
-    """交互模式增量编辑节点 —— 将用户补充信息融入简历半成品，或基于评审反馈自 refine"""
+    """v4.5 交互模式增量编辑节点 —— 将用户补充信息融入简历半成品，或基于评审反馈自 refine
+
+    新增: conversation_summary 注入，使编辑器具备跨轮次断点续传能力
+    """
     current_resume = state.get("revised_resume") or state.get("resume", "")
     user_input = state.get("user_supplement", "")
     jd = state.get("jd", "")
     eval_feedback = state.get("evaluation_feedback", "")
+    conversation_summary = state.get("conversation_summary", "") or "（首次编辑，暂无历史断点）"
 
     # ── 无任何输入 → 直接通过 ──
     if not user_input.strip() and not eval_feedback.strip():
@@ -82,6 +99,7 @@ def chat_editor_node(state: AgentState) -> dict:
     if user_input.strip():
         instruction_block = f'【用户刚刚输入的补充信息/修改意见】\n👉 "{user_input}"'
         prompt = CHAT_EDITOR_SYSTEM_PROMPT.format(
+            conversation_summary=conversation_summary,
             jd=jd,
             current_resume=current_resume,
             instruction_block=instruction_block,
@@ -89,6 +107,7 @@ def chat_editor_node(state: AgentState) -> dict:
         mode_label = "增量编辑"
     else:
         prompt = CHAT_EDITOR_REFINE_PROMPT.format(
+            conversation_summary=conversation_summary,
             jd=jd,
             current_resume=current_resume,
             feedback=eval_feedback,
@@ -113,10 +132,10 @@ def chat_editor_node(state: AgentState) -> dict:
         return {
             "revised_resume": current_resume,
             "node_status": f"模型调用异常 ({type(e).__name__})，已回退当前简历。",
-            "chat_history": [
+            "chat_history": (state.get("chat_history", []) + [
                 {"role": "user", "content": user_input},
                 {"role": "assistant", "content": f"编辑引擎暂时过热，已保留上一版本。错误: {type(e).__name__}"},
-            ] if user_input.strip() else [],
+            ]) if user_input.strip() else state.get("chat_history", []),
             "turn_count": state.get("turn_count", 0) + 1,
             "user_supplement": "",  # 清除已处理的输入
         }
@@ -130,10 +149,10 @@ def chat_editor_node(state: AgentState) -> dict:
         print(f"[chat_editor] 未找到 <clean_resume> 标签, 回退为当前简历 "
               f"(响应前200字符: {response_text[:200]})")
 
-    # ── 仅在有用户输入时记录对话历史 ──
-    new_chat_turn = []
+    # ── 仅在有用户输入时追加对话历史 ──
+    existing_history = state.get("chat_history", [])
     if user_input.strip():
-        new_chat_turn = [
+        existing_history = existing_history + [
             {"role": "user", "content": user_input},
             {"role": "assistant", "content": f"已根据您的要求完成增量编辑。"
                                              f"简历从 {len(current_resume)} 字符调整为 {len(updated_resume)} 字符。"},
@@ -142,7 +161,7 @@ def chat_editor_node(state: AgentState) -> dict:
     return {
         "revised_resume": updated_resume,
         "node_status": f"A4 画布重组完毕 ({mode_label})，正在移交评委进行二次指标准确度打分...",
-        "chat_history": new_chat_turn,
+        "chat_history": existing_history,
         "turn_count": state.get("turn_count", 0) + 1,
         "user_supplement": "",  # 清除已处理的输入，防止回环时重复消费
     }

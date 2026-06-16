@@ -55,7 +55,7 @@ def _tavily_search_raw(query: str, max_results: int = 5) -> list[dict]:
                 "max_results": max_results,
                 "include_raw_content": True,
             },
-            timeout=30,
+            timeout=120,
         )
         if resp.status_code == 200:
             data = resp.json()

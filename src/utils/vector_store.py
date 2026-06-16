@@ -115,10 +115,15 @@ def _get_bm25_corpus():
     return _bm25_corpus or []
 
 
-def hybrid_retrieve(query: str, vector_k: int = 10, bm25_k: int = 10, fusion_k: int = 5) -> list[Document]:
+def hybrid_retrieve(query: str, vector_k: int = 10, bm25_k: int = 10, fusion_k: int = 5, metadata_filter: dict | None = None) -> list[Document]:
+    """v4.2 混合检索：支持元数据硬过滤，阻断裂缝式跨租户数据泄露"""
     store = get_vector_store()
 
-    vector_results = store.similarity_search_with_score(query, k=vector_k)
+    search_kwargs: dict = {"k": vector_k}
+    if metadata_filter:
+        search_kwargs["filter"] = metadata_filter
+
+    vector_results = store.similarity_search_with_score(query, **search_kwargs)
     vector_ranked: dict[str, float] = {}
     for rank, (doc, score) in enumerate(vector_results):
         vector_ranked[doc.page_content] = rank + 1

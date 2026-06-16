@@ -16,7 +16,7 @@ def get_flash_client():
         api_key=os.getenv("DEEPSEEK_API_KEY"),
         base_url=os.getenv("DEEPSEEK_BASE_URL"),
         temperature=0.1,
-        timeout=60,
+        timeout=120,
         max_retries=3,
         streaming=False,
         default_headers={"Connection": "close"},
@@ -49,8 +49,8 @@ def _create_local_fallback(temperature: float = 0.3, max_tokens: int = 2048) -> 
         base_url=f"{_LOCAL_BASE_URL}/v1",
         temperature=temperature,
         max_tokens=max_tokens,
-        timeout=60,
-        max_retries=1,
+        timeout=120,
+        max_retries=2,
     )
 
 
@@ -59,9 +59,9 @@ def get_resilient_llm(
     max_tokens: int = 4096,
 ) -> ChatOpenAI:
     """
-    v4.1 双模供给器：云端 DeepSeek 主线 (timeout=30s) + 本地 gemma3:1b 备胎防线。
+    v4.5 双模供给器：云端 DeepSeek 主线 (timeout=120s) + 本地 gemma3:1b 备胎防线。
 
-    先尝试用 timeout=30s 的云端客户端探测，失败则自动降级到本地纯文本模型。
+    先尝试用 timeout=120s 的云端客户端探测，失败则自动降级到本地纯文本模型。
     本地备胎不具备 Function Calling 能力，调用方需通过 _is_fallback 属性判断。
     """
     try:
@@ -71,12 +71,12 @@ def get_resilient_llm(
             base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
             temperature=temperature,
             max_tokens=max_tokens,
-            timeout=30.0,  # v4.1：30s 超时，给 LangGraph 多轮 ReAct 留足吐字时间
-            max_retries=1,
+            timeout=120.0,
+            max_retries=3,
         )
         client.invoke("ping")
         client._is_fallback = False
-        logger.info("[LLM] 云端主线 DeepSeek 正常服役 (timeout=30s)。")
+        logger.info("[LLM] 云端主线 DeepSeek 正常服役 (timeout=120s)。")
         return client
     except Exception:
         logger.warning(
