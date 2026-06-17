@@ -1,0 +1,9 @@
+node_modules/
+.next/
+out/
+dist/
+.cache/
+.env
+.env.local
+*.md
+!AGENTS.md

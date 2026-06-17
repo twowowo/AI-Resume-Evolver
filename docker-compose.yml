@@ -1,0 +1,110 @@
+# ═══════════════════════════════════════════════════════════════
+# AI-Resume-Evolver v5.1 三军总指挥表 (Docker Compose)
+#
+# 启动: docker compose up -d
+# 停止: docker compose down
+# 查看日志: docker compose logs -f backend
+# ═══════════════════════════════════════════════════════════════
+
+services:
+
+  # ═══════════════════════════════════════════════════════════
+  # 1. ChromaDB 向量数据库
+  # ═══════════════════════════════════════════════════════════
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: resume-chromadb
+    restart: unless-stopped
+    ports:
+      - "8000:8000"  # ChromaDB 默认 HTTP 端口
+    volumes:
+      - ./data/chroma_data:/chroma/chroma  # 向量数据持久化
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+
+    networks:
+      - resume-net
+
+  # ═══════════════════════════════════════════════════════════
+  # 2. FastAPI 后端（双模有向图 + SqliteSaver + 三道安全防线）
+  # ═══════════════════════════════════════════════════════════
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-resume-evolver-backend:latest
+    container_name: resume-backend
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./data:/app/data  # SqliteSaver 持久化 (resume_state.db) + 种子数据
+    environment:
+      # ── 服务端口 ──
+      - PORT=8001
+
+      # ── DeepSeek 大模型 ──
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+      - MODEL_FLASH=${MODEL_FLASH:-deepseek-v4-flash}
+      - MODEL_PRO=${MODEL_PRO:-deepseek-v4-pro}
+      - USE_PRO_MODEL=${USE_PRO_MODEL:-true}
+
+      # ── Tavily 联网搜索 ──
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+
+      # ── Qwen-OCR 视觉引擎 ──
+      - QWEN_API_KEY=${QWEN_API_KEY}
+      - QWEN_BASE_URL=${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+
+      # ── ChromaDB（Docker 内互联，服务名即主机名）──
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+
+      # ── MySQL 持久化 ──
+      - DB_HOST=${DB_HOST:-host.docker.internal}
+      - DB_PORT=${DB_PORT:-3306}
+      - DB_USER=${DB_USER:-root}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME:-ai_resume_evolver}
+      - DB_CHARSET=${DB_CHARSET:-utf8mb4}
+      - DATABASE_URL=${DATABASE_URL}
+
+      # ── v5.1 安全三道防线 ──
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+      - API_AUTH_KEY=${API_AUTH_KEY:-local_bazhe_test_key}
+      - APP_MASTER_KEY=${APP_MASTER_KEY:-123zhoujiankai}
+      - JWT_SECRET=${JWT_SECRET:-zhoujiankai_jwt_secret_2026}
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
+      - JWT_EXPIRE_MINUTES=${JWT_EXPIRE_MINUTES:-1440}
+
+    depends_on:
+      chromadb:
+        condition: service_started
+    networks:
+      - resume-net
+
+  # ═══════════════════════════════════════════════════════════
+  # 3. React 前端（Next.js 静态导出 → Nginx 极简托管）
+  # ═══════════════════════════════════════════════════════════
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: ai-resume-evolver-frontend:latest
+    container_name: resume-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"  # 宿主机 8080 → 容器 Nginx 80
+    depends_on:
+      - backend
+    networks:
+      - resume-net
+
+# ═══════════════════════════════════════════════════════════
+# 桥接网络（三容器通过服务名互联）
+# ═══════════════════════════════════════════════════════════
+networks:
+  resume-net:
+    driver: bridge

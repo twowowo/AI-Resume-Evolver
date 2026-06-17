@@ -41,9 +41,12 @@ import io
 import tempfile
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from src.schemas.resume import (
     RadarMetrics,
@@ -53,15 +56,42 @@ from src.schemas.resume import (
 )
 from src.graph import build_graph
 from src.routes.agent_router import router as agent_router
+from src.auth.router import router as auth_router
 from src.nodes.visual_payload import compile_to_visual_payload
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 # ── 启动时加载 .env ──
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__) or ".", ".env"))
 
-# ── v3.0: 应用级共享图实例，挂载 MemorySaver 断点续传 ──
-_app_graph = build_graph(checkpointer=MemorySaver())
+# ── v5.0 持久化状态机：_app_graph 在 lifespan 中用 with SqliteSaver 解包后延迟编译 ──
+_app_graph = None  # lifespan 中通过 build_graph(checkpointer) 完成注入
+
+# ── v5.0 全局单例线程池：根除每请求建池的线程风暴 ──
+GLOBAL_POOL = ThreadPoolExecutor(max_workers=20)
+
+# ═══════════════════════════════════════════════════════════════
+# v5.2 三道安全防线：限流器(含IP白名单) + JWT Bearer Token + CORS 白名单
+# ═══════════════════════════════════════════════════════════════
+
+# ── 防线〇：Slowapi 限流豁免白名单（Docker网桥 + 本地回环免限流误杀）──
+EXEMPT_IPS = {"127.0.0.1", "localhost", "172.19.0.1"}
+
+def _rate_limit_key(request: Request):
+    """自定义限流键函数：白名单 IP 返回 None（豁免），其余走默认 IP 提取。
+
+    slowapi 内部对 key_func 返回 None 的请求完全跳过速率检查，
+    防止容器内网自调、本地调试等场景触发限流误杀。
+    """
+    client_ip = get_remote_address(request)
+    if client_ip in EXEMPT_IPS:
+        return None
+    return client_ip
+
+limiter = Limiter(key_func=_rate_limit_key)
+
+# ── 防线一：JWT Bearer Token 全局鉴权（v5.2 正规军认证系统）──
+from src.auth.security import get_current_user
 
 
 # ── SSE 工具函数 ──
@@ -115,50 +145,80 @@ def _safe_list(dims: dict, key: str) -> list[str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：启动时预热 ChromaDB + MemorySaver，关闭时清理"""
-    print("[server] AI-Resume-Evolver v4.1 启动中...")
-    print("[server] MemorySaver 断点续传已挂载到共享图实例")
-    print("[server] 预热 ChromaDB 连接 + 种子数据守卫...")
-    try:
-        from src.config import get_vector_db_client, get_collection_name, ensure_seed_data
-        # ── v4.1 种子数据守卫：空库自动灌入金牌案例 ──
-        seeded = ensure_seed_data()
-        if seeded > 0:
-            print(f"[server] 🛡️ 种子数据守卫已激活：自动灌入 {seeded} 条金牌案例")
-        # 二次确认库状态
-        client = get_vector_db_client()
-        collection = client.get_or_create_collection(name=get_collection_name())
-        count = collection.count()
-        print(f"[server] ChromaDB 就绪，Collection '{get_collection_name()}' 共 {count} 条向量")
-    except Exception as e:
-        print(f"[server] ChromaDB 预热失败（非致命）: {e}")
-    print("[server] 服务已就绪，接受请求。")
-    yield
-    print("[server] 服务关闭。")
+    """应用生命周期：AsyncSqliteSaver 异步解包 → 双图编译 → ChromaDB 预热"""
+    global _app_graph
+
+    print("[server] AI-Resume-Evolver v5.2 启动中...")
+
+    # ── v5.2 AsyncSqliteSaver 异步上下文管理器解包，生命周期 = 进程存活期 ──
+    os.makedirs("data", exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string("data/resume_state.db") as checkpointer:
+        _app_graph = build_graph(checkpointer=checkpointer)
+        print("[server] AsyncSqliteSaver 异步状态机已挂载 → data/resume_state.db")
+
+        # ── v5.2 认证种子守卫：自动建表 + admin 账号注入 ──
+        try:
+            from src.auth.seed import ensure_users_table_and_admin
+            ensure_users_table_and_admin()
+        except Exception as e:
+            print(f"[server] 认证种子注入失败（非致命）: {e}")
+
+        print("[server] 预热 ChromaDB 连接 + 种子数据守卫...")
+        try:
+            from src.config import get_vector_db_client, get_collection_name, ensure_seed_data
+            seeded = ensure_seed_data()
+            if seeded > 0:
+                print(f"[server] 种子数据守卫已激活：自动灌入 {seeded} 条金牌案例")
+            client = get_vector_db_client()
+            collection = client.get_or_create_collection(name=get_collection_name())
+            count = collection.count()
+            print(f"[server] ChromaDB 就绪，Collection '{get_collection_name()}' 共 {count} 条向量")
+        except Exception as e:
+            print(f"[server] ChromaDB 预热失败（非致命）: {e}")
+
+        # ── v5.0 双图共用同一个 SqliteSaver，agent graph 延迟注入 ──
+        from src.graphs.agent_graph import init_agent_checkpointer
+        init_agent_checkpointer(checkpointer)
+        print("[server] Agent Graph checkpointer 注入完成，双图共用 data/resume_state.db")
+
+        print("[server] 服务已就绪，接受请求。")
+        yield
+        print("[server] 服务关闭。")
 
 
 app = FastAPI(
     title="AI-Resume-Evolver API",
     description="AI 简历智能优化引擎 —— 一键生成 + 多智能体博弈 + MockInterviewer 压测 + 多轮交互",
-    version="3.0.0",
+    version="5.1.0",
     lifespan=lifespan,
+    dependencies=[Depends(get_current_user)],  # v5.2 JWT Bearer Token 全局鉴权
 )
 
-# ── CORS 跨域 ──
+# ── v5.1 CORS 白名单（从环境变量读取，杜绝 allow_origins=["*"]）──
+_allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080")
+ALLOWED_ORIGINS = [origin.strip() for origin in _allowed_origins_str.split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ── v5.1 Slowapi 限流器注册 + 429 异常处理器 ──
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, lambda request, exc: JSONResponse(
+    status_code=429,
+    content={"detail": "[限流熔断] 请求过于频繁，请等待 1 分钟后再试。"},
+))
+
 
 # ── 健康检查 ──
 
 @app.get("/health")
-async def health_check():
-    return {"status": "ok", "version": "3.0.0", "service": "AI-Resume-Evolver"}
+@limiter.limit("60/minute")
+async def health_check(request: Request):
+    return {"status": "ok", "version": "5.1.0", "service": "AI-Resume-Evolver"}
 
 
 # ── SSE 流式管道 ──
@@ -195,132 +255,132 @@ async def _stream_pipeline(initial_state: dict, thread_id: str = ""):
     yielded_resume = False
     final_state = None
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        pool.submit(_run_graph)
+    GLOBAL_POOL.submit(_run_graph)
 
-        while True:
-            status, value = await queue.get()
+    while True:
+        status, value = await queue.get()
 
-            if status == "error":
-                traceback.print_exc()
-                yield _sse_event("error", {
-                    "error": f"{type(value).__name__}: {str(value)[:200]}"
-                })
-                yield _sse_event("done", {})
-                return
-
-            if status == "done":
-                break
-
-            # status == "state": 处理每次节点完成后的全量状态快照
-            state = value
-            final_state = state
-
-            # ── 里程碑 1: PreEvaluator 完成 → 推送原始简历雷达 + 诊断原文 ──
-            if not yielded_radar and state.get("pre_eval_dimensions"):
-                yielded_radar = True
-                dims = state["pre_eval_dimensions"]
-                pre_total = dims.get("jd_match", 0) + dims.get("star_completion", 0) + dims.get("verb_quality", 0)
-                if pre_total == 0:
-                    pre_total = state.get("score", 0)
-                radar = RadarMetrics.from_dimensions(dims, pre_total)
-
-                # ── v4.6 诊断原文：从 pre_eval_dimensions 提取结构化诊断数据 ──
-                diagnosis = {
-                    "feedback": state.get("evaluation_feedback", ""),
-                    "core_tool_overlap": state.get("node_status", ""),
-                    "matched_skills": _safe_list(dims, "matched_skills"),
-                    "missing_skills": _safe_list(dims, "missing_skills"),
-                    "star_strengths": _safe_list(dims, "star_strengths"),
-                    "star_weaknesses": _safe_list(dims, "star_weaknesses"),
-                    "weak_verbs": _safe_list(dims, "weak_verbs"),
-                }
-
-                yield _sse_event("radar_init", {
-                    "original_resume_radar": {
-                        "jd_matching_score": radar.jd_matching_score,
-                        "star_perf_score": radar.star_perf_score,
-                        "action_verbs_score": radar.action_verbs_score,
-                        "total_score": radar.total_score,
-                    },
-                    "diagnosis": diagnosis,
-                })
-                print(f"[sse] 分帧1 radar_init: 原始雷达 {pre_total}/100 "
-                      f"(JD: {radar.jd_matching_score}/60, STAR: {radar.star_perf_score}/30, "
-                      f"Verb: {radar.action_verbs_score}/10) | "
-                      f"覆盖技能: {len(diagnosis['matched_skills'])}项, "
-                      f"缺失: {len(diagnosis['missing_skills'])}项")
-
-            # ── 里程碑 2: Editor 完成 → 推送精修简历文本 + 混合解耦载荷 ──
-            if not yielded_resume and state.get("revised_resume"):
-                yielded_resume = True
-                revised = state["revised_resume"]
-                opt_summary = state.get("optimization_summary", "")
-                clean_json = state.get("clean_resume_json", {})
-                vp = compile_to_visual_payload(revised)
-                yield _sse_event("resume_stream", {
-                    "optimized_resume_text": revised,
-                    "text_length": len(revised),
-                    "optimization_summary": opt_summary,
-                    "clean_resume_json": clean_json,
-                    "visual_payload": vp,
-                })
-                print(f"[sse] 分帧2 resume_stream: 精修文本 {len(revised)} 字符, "
-                      f"skills={len(vp.get('skills', []))}项, "
-                      f"summary {len(opt_summary)} 字符, json_keys {list(clean_json.keys()) if clean_json else '[]'}")
-
-        # ── 里程碑 3: 全链路完成 → 推送终评雷达 + 压测题 ──
-        if final_state:
-            eval_dims = final_state.get("eval_dimensions", {})
-            eval_score = final_state.get("score", 0)
-            opt_radar = _build_radar(eval_dims, eval_score)
-
-            questions = _build_stress_questions(
-                final_state.get("stress_test_questions", [])
-            )
-
-            pre_eval_dims = final_state.get("pre_eval_dimensions", {})
-            pre_total = (pre_eval_dims.get("jd_match", 0) +
-                         pre_eval_dims.get("star_completion", 0) +
-                         pre_eval_dims.get("verb_quality", 0))
-
-            is_extreme_gap = final_state.get("difficulty_flag", "") == "EXTREME_GAP"
-            revised_final = final_state.get("revised_resume", "")
-            vp_final = compile_to_visual_payload(revised_final) if revised_final else {}
-
-            yield _sse_event("final", {
-                "optimized_resume_radar": {
-                    "jd_matching_score": opt_radar.jd_matching_score if opt_radar else 0,
-                    "star_perf_score": opt_radar.star_perf_score if opt_radar else 0,
-                    "action_verbs_score": opt_radar.action_verbs_score if opt_radar else 0,
-                    "total_score": opt_radar.total_score if opt_radar else eval_score,
-                },
-                "optimized_resume_text": revised_final,
-                "stress_test_questions": questions,
-                "difficulty_flag": final_state.get("difficulty_flag", ""),
-                "is_extreme_gap": is_extreme_gap,
-                "iteration_count": final_state.get("iteration_count", 0),
-                "score_improvement": eval_score - pre_total if pre_total > 0 else 0,
-                "internal_monologue": final_state.get("internal_monologue", ""),
-                "evaluation_feedback": final_state.get("evaluation_feedback", ""),
-                "pre_eval_dimensions": pre_eval_dims,
-                "eval_dimensions": eval_dims,
-                "optimization_summary": final_state.get("optimization_summary", ""),
-                "clean_resume_json": final_state.get("clean_resume_json", {}),
-                "visual_payload": vp_final,
-                "session_id": thread_id,
+        if status == "error":
+            traceback.print_exc()
+            yield _sse_event("error", {
+                "error": f"{type(value).__name__}: {str(value)[:200]}"
             })
-            print(f"[sse] 分帧3 final: 终评 {eval_score}/100, 压测题 {len(questions)} 道, "
-                  f"提升 +{eval_score - pre_total if pre_total > 0 else 'N/A'} 分")
+            yield _sse_event("done", {})
+            return
 
-        yield _sse_event("done", {})
-        print(f"[sse] 流式推送完成 (4/4 帧已全部发送), thread_id={thread_id}")
+        if status == "done":
+            break
+
+        # status == "state": 处理每次节点完成后的全量状态快照
+        state = value
+        final_state = state
+
+        # ── 里程碑 1: PreEvaluator 完成 → 推送原始简历雷达 + 诊断原文 ──
+        if not yielded_radar and state.get("pre_eval_dimensions"):
+            yielded_radar = True
+            dims = state["pre_eval_dimensions"]
+            pre_total = dims.get("jd_match", 0) + dims.get("star_completion", 0) + dims.get("verb_quality", 0)
+            if pre_total == 0:
+                pre_total = state.get("score", 0)
+            radar = RadarMetrics.from_dimensions(dims, pre_total)
+
+            # ── v4.6 诊断原文：从 pre_eval_dimensions 提取结构化诊断数据 ──
+            diagnosis = {
+                "feedback": state.get("evaluation_feedback", ""),
+                "core_tool_overlap": state.get("node_status", ""),
+                "matched_skills": _safe_list(dims, "matched_skills"),
+                "missing_skills": _safe_list(dims, "missing_skills"),
+                "star_strengths": _safe_list(dims, "star_strengths"),
+                "star_weaknesses": _safe_list(dims, "star_weaknesses"),
+                "weak_verbs": _safe_list(dims, "weak_verbs"),
+            }
+
+            yield _sse_event("radar_init", {
+                "original_resume_radar": {
+                    "jd_matching_score": radar.jd_matching_score,
+                    "star_perf_score": radar.star_perf_score,
+                    "action_verbs_score": radar.action_verbs_score,
+                    "total_score": radar.total_score,
+                },
+                "diagnosis": diagnosis,
+            })
+            print(f"[sse] 分帧1 radar_init: 原始雷达 {pre_total}/100 "
+                  f"(JD: {radar.jd_matching_score}/60, STAR: {radar.star_perf_score}/30, "
+                  f"Verb: {radar.action_verbs_score}/10) | "
+                  f"覆盖技能: {len(diagnosis['matched_skills'])}项, "
+                  f"缺失: {len(diagnosis['missing_skills'])}项")
+
+        # ── 里程碑 2: Editor 完成 → 推送精修简历文本 + 混合解耦载荷 ──
+        if not yielded_resume and state.get("revised_resume"):
+            yielded_resume = True
+            revised = state["revised_resume"]
+            opt_summary = state.get("optimization_summary", "")
+            clean_json = state.get("clean_resume_json", {})
+            vp = compile_to_visual_payload(revised)
+            yield _sse_event("resume_stream", {
+                "optimized_resume_text": revised,
+                "text_length": len(revised),
+                "optimization_summary": opt_summary,
+                "clean_resume_json": clean_json,
+                "visual_payload": vp,
+            })
+            print(f"[sse] 分帧2 resume_stream: 精修文本 {len(revised)} 字符, "
+                  f"skills={len(vp.get('skills', []))}项, "
+                  f"summary {len(opt_summary)} 字符, json_keys {list(clean_json.keys()) if clean_json else '[]'}")
+
+    # ── 里程碑 3: 全链路完成 → 推送终评雷达 + 压测题 ──
+    if final_state:
+        eval_dims = final_state.get("eval_dimensions", {})
+        eval_score = final_state.get("score", 0)
+        opt_radar = _build_radar(eval_dims, eval_score)
+
+        questions = _build_stress_questions(
+            final_state.get("stress_test_questions", [])
+        )
+
+        pre_eval_dims = final_state.get("pre_eval_dimensions", {})
+        pre_total = (pre_eval_dims.get("jd_match", 0) +
+                     pre_eval_dims.get("star_completion", 0) +
+                     pre_eval_dims.get("verb_quality", 0))
+
+        is_extreme_gap = final_state.get("difficulty_flag", "") == "EXTREME_GAP"
+        revised_final = final_state.get("revised_resume", "")
+        vp_final = compile_to_visual_payload(revised_final) if revised_final else {}
+
+        yield _sse_event("final", {
+            "optimized_resume_radar": {
+                "jd_matching_score": opt_radar.jd_matching_score if opt_radar else 0,
+                "star_perf_score": opt_radar.star_perf_score if opt_radar else 0,
+                "action_verbs_score": opt_radar.action_verbs_score if opt_radar else 0,
+                "total_score": opt_radar.total_score if opt_radar else eval_score,
+            },
+            "optimized_resume_text": revised_final,
+            "stress_test_questions": questions,
+            "difficulty_flag": final_state.get("difficulty_flag", ""),
+            "is_extreme_gap": is_extreme_gap,
+            "iteration_count": final_state.get("iteration_count", 0),
+            "score_improvement": eval_score - pre_total if pre_total > 0 else 0,
+            "internal_monologue": final_state.get("internal_monologue", ""),
+            "evaluation_feedback": final_state.get("evaluation_feedback", ""),
+            "pre_eval_dimensions": pre_eval_dims,
+            "eval_dimensions": eval_dims,
+            "optimization_summary": final_state.get("optimization_summary", ""),
+            "clean_resume_json": final_state.get("clean_resume_json", {}),
+            "visual_payload": vp_final,
+            "session_id": thread_id,
+        })
+        print(f"[sse] 分帧3 final: 终评 {eval_score}/100, 压测题 {len(questions)} 道, "
+              f"提升 +{eval_score - pre_total if pre_total > 0 else 'N/A'} 分")
+
+    yield _sse_event("done", {})
+    print(f"[sse] 流式推送完成 (4/4 帧已全部发送), thread_id={thread_id}")
 
 
 # ── 核心路由：简历优化 ──
 
 @app.post("/api/v1/resume/optimize")
-async def optimize_resume(request: ResumeOptimizeRequest):
+@limiter.limit("5/minute")
+async def optimize_resume(request: Request, payload: ResumeOptimizeRequest):
     """
     简历优化接口 —— SSE 流式事件推送。
 
@@ -339,19 +399,19 @@ async def optimize_resume(request: ResumeOptimizeRequest):
     此端点返回的 final 帧中包含 session_id，前端需保存该 ID 用于后续 chat 调用。
     """
     # ── v4.2 三层漏斗 Layer 1: 动态复合钥匙 f"{user_id}_{resume_id}" ──
-    user_id = request.user_id
-    resume_id = request.resume_id
+    user_id = payload.user_id
+    resume_id = payload.resume_id
     thread_id = f"{user_id}::{resume_id}"
     print(f"[记忆沙箱点火] 线程已锁定: {thread_id}")
 
-    print(f"\n[api] 收到优化请求 [{request.mode.value}]: 简历 {len(request.resume_text)} 字符, "
-          f"JD {len(request.jd_text)} 字符, thread_id={thread_id}")
+    print(f"\n[api] 收到优化请求 [{payload.mode.value}]: 简历 {len(payload.resume_text)} 字符, "
+          f"JD {len(payload.jd_text)} 字符, thread_id={thread_id}")
 
     initial_state = {
         "user_id": user_id,
         "resume_id": resume_id,
-        "resume": request.resume_text,
-        "jd": request.jd_text,
+        "resume": payload.resume_text,
+        "jd": payload.jd_text,
         "rag_context": "",
         "revised_resume": "",
         "internal_monologue": "",
@@ -428,90 +488,90 @@ async def _stream_chat_pipeline(thread_id: str, user_message: str):
     final_state = None
     last_resume_len = 0
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        pool.submit(_run_graph)
+    GLOBAL_POOL.submit(_run_graph)
 
-        while True:
-            status, value = await queue.get()
+    while True:
+        status, value = await queue.get()
 
-            if status == "error":
-                traceback.print_exc()
-                yield _sse_event("error", {
-                    "error": f"{type(value).__name__}: {str(value)[:200]}"
-                })
-                yield _sse_event("done", {})
-                return
-
-            if status == "done":
-                break
-
-            state = value
-            final_state = state
-
-            # ── 帧: node_status 状态推送 (对齐前端 status case) ──
-            node_status = state.get("node_status", "")
-            if node_status:
-                yield _sse_event("status", {
-                    "node_status": node_status,
-                    "turn_count": state.get("turn_count", 0),
-                })
-                print(f"[chat_sse] status: {node_status[:80]}...")
-
-            # ── 帧: 简历文本变更推送 (对齐前端 resume_stream case) ──
-            revised = state.get("revised_resume", "")
-            if revised and len(revised) != last_resume_len:
-                last_resume_len = len(revised)
-                vp = compile_to_visual_payload(revised)
-                yield _sse_event("resume_stream", {
-                    "optimized_resume_text": revised,
-                    "text_length": len(revised),
-                    "turn_count": state.get("turn_count", 0),
-                    "node_status": node_status or "",
-                    "visual_payload": vp,
-                })
-                print(f"[chat_sse] resume_stream: {len(revised)} 字符, "
-                      f"skills={len(vp.get('skills', []))}项")
-
-        # ── 终帧: 评分 + 压测题 + 混合解耦载荷 ──
-        if final_state:
-            eval_dims = final_state.get("eval_dimensions", {})
-            eval_score = final_state.get("score", 0)
-            opt_radar = _build_radar(eval_dims, eval_score)
-
-            questions = _build_stress_questions(
-                final_state.get("stress_test_questions", [])
-            )
-
-            revised_final = final_state.get("revised_resume", "")
-            vp_final = compile_to_visual_payload(revised_final) if revised_final else {}
-
-            yield _sse_event("final", {
-                "optimized_resume_radar": {
-                    "jd_matching_score": opt_radar.jd_matching_score if opt_radar else 0,
-                    "star_perf_score": opt_radar.star_perf_score if opt_radar else 0,
-                    "action_verbs_score": opt_radar.action_verbs_score if opt_radar else 0,
-                    "total_score": opt_radar.total_score if opt_radar else eval_score,
-                },
-                "optimized_resume_text": revised_final,
-                "stress_test_questions": questions,
-                "difficulty_flag": final_state.get("difficulty_flag", ""),
-                "turn_count": final_state.get("turn_count", 0),
-                "internal_monologue": final_state.get("internal_monologue", ""),
-                "visual_payload": vp_final,
-                "session_id": thread_id,
+        if status == "error":
+            traceback.print_exc()
+            yield _sse_event("error", {
+                "error": f"{type(value).__name__}: {str(value)[:200]}"
             })
-            print(f"[chat_sse] final: 终评 {eval_score}/100, "
-                  f"skills={len(vp_final.get('skills', []))}项, "
-                  f"轮次 {final_state.get('turn_count', 0)}, 压测题 {len(questions)} 道")
+            yield _sse_event("done", {})
+            return
 
-        yield _sse_event("done", {})
-        print(f"[chat_sse] 交互流推送完成, thread_id={thread_id}")
+        if status == "done":
+            break
+
+        state = value
+        final_state = state
+
+        # ── 帧: node_status 状态推送 (对齐前端 status case) ──
+        node_status = state.get("node_status", "")
+        if node_status:
+            yield _sse_event("status", {
+                "node_status": node_status,
+                "turn_count": state.get("turn_count", 0),
+            })
+            print(f"[chat_sse] status: {node_status[:80]}...")
+
+        # ── 帧: 简历文本变更推送 (对齐前端 resume_stream case) ──
+        revised = state.get("revised_resume", "")
+        if revised and len(revised) != last_resume_len:
+            last_resume_len = len(revised)
+            vp = compile_to_visual_payload(revised)
+            yield _sse_event("resume_stream", {
+                "optimized_resume_text": revised,
+                "text_length": len(revised),
+                "turn_count": state.get("turn_count", 0),
+                "node_status": node_status or "",
+                "visual_payload": vp,
+            })
+            print(f"[chat_sse] resume_stream: {len(revised)} 字符, "
+                  f"skills={len(vp.get('skills', []))}项")
+
+    # ── 终帧: 评分 + 压测题 + 混合解耦载荷 ──
+    if final_state:
+        eval_dims = final_state.get("eval_dimensions", {})
+        eval_score = final_state.get("score", 0)
+        opt_radar = _build_radar(eval_dims, eval_score)
+
+        questions = _build_stress_questions(
+            final_state.get("stress_test_questions", [])
+        )
+
+        revised_final = final_state.get("revised_resume", "")
+        vp_final = compile_to_visual_payload(revised_final) if revised_final else {}
+
+        yield _sse_event("final", {
+            "optimized_resume_radar": {
+                "jd_matching_score": opt_radar.jd_matching_score if opt_radar else 0,
+                "star_perf_score": opt_radar.star_perf_score if opt_radar else 0,
+                "action_verbs_score": opt_radar.action_verbs_score if opt_radar else 0,
+                "total_score": opt_radar.total_score if opt_radar else eval_score,
+            },
+            "optimized_resume_text": revised_final,
+            "stress_test_questions": questions,
+            "difficulty_flag": final_state.get("difficulty_flag", ""),
+            "turn_count": final_state.get("turn_count", 0),
+            "internal_monologue": final_state.get("internal_monologue", ""),
+            "visual_payload": vp_final,
+            "session_id": thread_id,
+        })
+        print(f"[chat_sse] final: 终评 {eval_score}/100, "
+              f"skills={len(vp_final.get('skills', []))}项, "
+              f"轮次 {final_state.get('turn_count', 0)}, 压测题 {len(questions)} 道")
+
+    yield _sse_event("done", {})
+    print(f"[chat_sse] 交互流推送完成, thread_id={thread_id}")
 
 
 # ── 交互模式路由：多轮对话 ──
 
 @app.post("/api/v1/resume/chat")
-async def chat_resume(request: ChatRequest):
+@limiter.limit("10/minute")
+async def chat_resume(request: Request, payload: ChatRequest):
     """
     多轮对话交互编辑接口 —— SSE 流式事件推送。
 
@@ -528,11 +588,11 @@ async def chat_resume(request: ChatRequest):
     | `done` | 流正常结束 | 空 JSON `{}` |
     | `error` | 异常中断 | `error`: 异常信息 |
     """
-    print(f"\n[api] 收到交互补充请求: thread_id={request.thread_id}, "
-          f"message={len(request.user_message)} 字符")
+    print(f"\n[api] 收到交互补充请求: thread_id={payload.thread_id}, "
+          f"message={len(payload.user_message)} 字符")
 
     return StreamingResponse(
-        _stream_chat_pipeline(request.thread_id, request.user_message),
+        _stream_chat_pipeline(payload.thread_id, payload.user_message),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -544,7 +604,8 @@ async def chat_resume(request: ChatRequest):
 # ── 多模态文件上传解析端点 ──
 
 @app.post("/api/v1/upload/parse")
-async def upload_and_parse(file: UploadFile = File(...)):
+@limiter.limit("10/minute")
+async def upload_and_parse(request: Request, file: UploadFile = File(...)):
     """
     文件/截屏上传解析端点 —— 支持 PDF/DOCX/TXT 文件物理去噪 + 图片多模态 Vision OCR。
 
@@ -637,16 +698,19 @@ async def upload_and_parse(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"文件解析失败: {str(e)[:200]}")
 
 
+# ── v5.2 JWT 认证路由：POST /api/v1/auth/login ──
+app.include_router(auth_router)
+
 # ── Agent 模式路由：LangGraph ReAct 中央大脑 SSE 流式端点 ──
 app.include_router(agent_router)
 
 if __name__ == "__main__":
     import uvicorn
-    print("启动 AI-Resume-Evolver FastAPI 服务 v3.0 (双模拓扑 + MemorySaver)...")
+    print("启动 AI-Resume-Evolver FastAPI 服务 v5.0 (双模拓扑 + SqliteSaver + 全局线程池)...")
     uvicorn.run(
         "main:app",
-        host="127.0.0.1",       # v2.6: 死锁 127.0.0.1，根除 Windows 0.0.0.0 解析冲突
-        port=8001,
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=int(os.getenv("PORT", "8001")),
         reload=False,
         log_level="info",
         timeout_keep_alive=300,  # 长连接保活 5 分钟（覆盖串行 LLM 调用的完整链路）

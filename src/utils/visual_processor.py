@@ -21,6 +21,8 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from PIL import Image as _PILImage
+_PILImage.MAX_IMAGE_PIXELS = 50_000_000  # v5.0 硬限制 5000万像素，封杀解压炸弹
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -93,20 +95,27 @@ async def parse_resume_image_via_vlm(image_bytes: bytes) -> str:
     """
     client = _get_async_client()
 
-    # ── 图片物理编码为 Base64 Data URL ──
-    image = _detect_and_convert(image_bytes)
-    buffered = io.BytesIO()
-    # 统一输出为 JPEG 以控制体积（百炼 Vision 限制单图 < 20MB）
-    save_format = "JPEG" if image.mode != "RGBA" else "PNG"
-    image.save(buffered, format=save_format, quality=85)
-    encoded = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    mime = "image/jpeg" if save_format == "JPEG" else "image/png"
-    data_url = f"data:{mime};base64,{encoded}"
+    # ── v5.0 图片物理编码为 Base64 Data URL（全流程异常捕获，防损坏图片/解压炸弹）──
+    try:
+        image = _detect_and_convert(image_bytes)
+        buffered = io.BytesIO()
+        # 统一输出为 JPEG 以控制体积（百炼 Vision 限制单图 < 20MB）
+        save_format = "JPEG" if image.mode != "RGBA" else "PNG"
+        image.save(buffered, format=save_format, quality=85)
+        encoded = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        mime = "image/jpeg" if save_format == "JPEG" else "image/png"
+        data_url = f"data:{mime};base64,{encoded}"
 
-    logger.info(
-        f"[Qwen-OCR] 图片已编码: {image.size[0]}x{image.size[1]}, "
-        f"Base64 长度={len(encoded)} 字符, 格式={save_format}"
-    )
+        logger.info(
+            f"[Qwen-OCR] 图片已编码: {image.size[0]}x{image.size[1]}, "
+            f"Base64 长度={len(encoded)} 字符, 格式={save_format}"
+        )
+    except Exception as e:
+        logger.error(f"[Qwen-OCR] 图片解码/编码失败: {type(e).__name__}: {str(e)[:200]}")
+        raise RuntimeError(
+            f"[视觉引擎] 图片解析失败 ({type(e).__name__})，"
+            f"请确认上传的是有效的 PNG/JPG/WEBP/BMP 格式图片，而非损坏文件或解压炸弹。"
+        )
 
     # ── v4.5 调用 Qwen-OCR 特种模型 (百炼 DashScope 兼容模式) ──
     # 格式准则：

@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from sqlalchemy import select
 
-from src.graphs.agent_graph import agent_compiled_graph
+from src.graphs import agent_graph as _agent_graph_module
 from src.database.connection import SessionLocal
 from src.database.models import UserResume
 from src.utils.llm import get_flash_client
@@ -231,7 +231,7 @@ async def stream_agent_brain(payload: AgentPayload):
                 "data": f"中央大脑 ReAct 闭环拓扑点火成功... [沙箱: {thread_id}]"
             }, ensure_ascii=False) + "\n\n")
 
-            async for event in agent_compiled_graph.astream(initial_state, config):
+            async for event in _agent_graph_module.agent_compiled_graph.astream(initial_state, config):
                 if circuit_breached:
                     break
 

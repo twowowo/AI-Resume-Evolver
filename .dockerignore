@@ -1,0 +1,35 @@
+# ── Python ──
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ── IDE ──
+.idea/
+.vscode/
+.claude/
+
+# ── Git ──
+.git/
+.gitignore
+
+# ── 敏感文件（容器内用 .env 注入，不打包镜像）──
+.env
+
+# ── 数据目录（运行时挂载，不打包镜像）──
+data/
+chroma_db/
+output/
+vector_db/
+
+# ── 前端（独立构建）──
+frontend/
+
+# ── 测试 / 调试文件 ──
+tests/
+*.txt
+!requirements.txt
+findings.md
+progress.md
+task_plan.md

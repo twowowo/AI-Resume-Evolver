@@ -16,12 +16,15 @@ import AgentConsole from "@/components/AgentConsole";
 import PipelinePanel from "@/components/PipelinePanel";
 import PipelineInput from "@/components/PipelineInput";
 import AgentLayout from "@/components/AgentLayout";
+import { LoginOverlay } from "@/components/LoginOverlay";
+import { useAuth } from "@/contexts/AuthContext";
 import { usePipelineStream } from "@/hooks/usePipelineStream";
 import { useAgentStream } from "@/hooks/useAgentStream";
 
 type AppMode = "pipeline" | "agent";
 
 export default function Home() {
+  const { user, token, isLoading: authLoading, logout } = useAuth();
   const [appMode, setAppMode] = useState<AppMode>("pipeline");
 
   // ── Pipeline 模式顶层状态：双 Hook 并网 ──
@@ -62,18 +65,40 @@ export default function Home() {
     setForceInputMode(true);
   }, []);
 
+  // ── 认证加载态 ──
+  if (authLoading) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-zinc-950">
+        <div className="text-sm text-zinc-400 animate-pulse">加载中...</div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-zinc-100 dark:bg-zinc-950">
+      {/* ── v5.2 登录遮罩：未认证时覆盖全屏 ── */}
+      {!user && <LoginOverlay />}
+
       {/* ── 双模并网入口：Splash 卡片选择器 ── */}
       <div className="flex-shrink-0 bg-white dark:bg-black border-b-2 border-zinc-200 dark:border-zinc-800">
         <div className="max-w-2xl mx-auto px-6 py-4">
-          <div className="text-center mb-4">
-            <h1 className="text-base font-bold text-zinc-800 dark:text-zinc-100">
-              AI-Resume-Evolver 4.1
-            </h1>
-            <p className="text-xs text-zinc-500 mt-0.5">
-              选择工作模式，智能简历优化引擎全力驱动
-            </p>
+          <div className="flex items-center justify-between mb-4">
+            <div className="text-center flex-1">
+              <h1 className="text-base font-bold text-zinc-800 dark:text-zinc-100">
+                AI-Resume-Evolver 5.2
+              </h1>
+              <p className="text-xs text-zinc-500 mt-0.5">
+                选择工作模式，智能简历优化引擎全力驱动
+              </p>
+            </div>
+            {user && (
+              <button
+                onClick={logout}
+                className="shrink-0 px-3 py-1.5 text-[11px] font-medium rounded-lg border border-zinc-300 dark:border-zinc-700 text-zinc-500 hover:text-zinc-300 hover:border-zinc-500 transition-colors"
+              >
+                {user.username} · 登出
+              </button>
+            )}
           </div>
 
           <div className="grid grid-cols-2 gap-3">

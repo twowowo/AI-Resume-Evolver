@@ -56,7 +56,10 @@ export function usePipelineStream() {
           "http://127.0.0.1:8001/api/v1/resume/optimize",
           {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${localStorage.getItem("resume_auth_token") ?? ""}`,
+            },
             body: JSON.stringify({
               resume_text: resumeText,
               jd_text: jdText,

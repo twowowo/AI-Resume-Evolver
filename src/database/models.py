@@ -2,8 +2,9 @@
 SQLAlchemy 2.0 现代 ORM 声明式映射模型
 
 表结构:
-  1. user_resumes   — 简历四章节微创手术刀持久化 (user_id 唯一，按章节 UPDATE)
-  2. user_profiles  — 用户求职意图长期画像记忆 (user_id + profile_key 联合唯一，幂等 Upsert)
+  1. users          — 登录账密认证 (v5.2 JWT 认证系统)
+  2. user_resumes   — 简历四章节微创手术刀持久化 (user_id 唯一，按章节 UPDATE)
+  3. user_profiles  — 用户求职意图长期画像记忆 (user_id + profile_key 联合唯一，幂等 Upsert)
 """
 
 import datetime
@@ -22,7 +23,33 @@ class Base(DeclarativeBase):
 
 
 # ==========================================
-# 📝 2. 用户简历结构化持久化表模型
+# 👤 2. 用户登录账密表模型（v5.2 JWT 认证系统）
+# ==========================================
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True, comment="自增主键"
+    )
+    username: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True, comment="登录用户名，全局唯一"
+    )
+    hashed_password: Mapped[str] = mapped_column(
+        String(256), nullable=False, comment="bcrypt 哈希密文"
+    )
+    is_active: Mapped[bool] = mapped_column(
+        default=True, comment="账号是否激活，管理员可停用"
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        comment="账号创建时间",
+    )
+
+
+# ==========================================
+# 📝 3. 用户简历结构化持久化表模型
 # ==========================================
 
 class UserResume(Base):
@@ -58,7 +85,7 @@ class UserResume(Base):
 
 
 # ==========================================
-# 🧊 3. 用户求职意图与长期记忆画像表模型 (Upsert 专属)
+# 🧊 4. 用户求职意图与长期记忆画像表模型 (Upsert 专属)
 # ==========================================
 
 class UserProfile(Base):

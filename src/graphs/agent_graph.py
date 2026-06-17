@@ -26,7 +26,6 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
 
 # 导入步骤1中通过20项压测的完全体武器库
 from src.tools.agent_tools import AGENT_TOOLS
@@ -161,6 +160,10 @@ workflow.add_conditional_edges(
 # 构成了 ReAct 的无限思考环路
 workflow.add_edge("tools_executor", "agent_brain")
 
-# ── v4.1 MemorySaver 状态机持久化：强制注入 Checkpointer 内存持久化锁 ──
-memory = MemorySaver()
-agent_compiled_graph = workflow.compile(checkpointer=memory)
+# ── v5.0 延迟初始化：checkpointer 由 main.py 统一注入，双图共用同一个 SqliteSaver ──
+agent_compiled_graph = None  # 由 init_agent_checkpointer() 在 lifespan 中完成编译
+
+def init_agent_checkpointer(checkpointer):
+    """由 main.py lifespan 调用，注入与 _app_graph 共享的 SqliteSaver"""
+    global agent_compiled_graph
+    agent_compiled_graph = workflow.compile(checkpointer=checkpointer)

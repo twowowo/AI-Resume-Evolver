@@ -100,6 +100,7 @@ export async function analyzeFileToText(file: File): Promise<string> {
   try {
     const response = await fetch(VISION_API, {
       method: "POST",
+      headers: { "Authorization": `Bearer ${localStorage.getItem("resume_auth_token") ?? ""}` },
       body: formData,
       signal: controller.signal,
     });

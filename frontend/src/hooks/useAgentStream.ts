@@ -58,7 +58,10 @@ export function useAgentStream() {
     try {
       const response = await fetch("http://127.0.0.1:8001/api/agent/stream", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${localStorage.getItem("resume_auth_token") ?? ""}`,
+        },
         body: JSON.stringify({
           user_query: userQuery,
           user_id: "default_user",     // v4.2 演示期默认值，后续从 auth context 注入
