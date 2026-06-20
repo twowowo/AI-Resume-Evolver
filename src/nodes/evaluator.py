@@ -237,10 +237,11 @@ def evaluator_node(state: AgentState):
     反幻觉判定：合理上下文推导不扣分，仅恶意捏造才惩罚。
     评分递进梯度：优秀精修版稳定在 80-90 区间。
     """
-    revised_resume = state.get("revised_resume", "")
-    jd = state.get("jd", "")
-    original_resume = state.get("resume", "")
-    iteration_count = state.get("iteration_count", 0)
+    # ── v5.9 None 安全兜底 ──
+    revised_resume = state.get("revised_resume") or ""
+    jd = state.get("jd") or ""
+    original_resume = state.get("resume") or ""
+    iteration_count = state.get("iteration_count") or 0
 
     if not revised_resume.strip():
         return {
@@ -304,7 +305,7 @@ def evaluator_node(state: AgentState):
             print(f"[evaluator] 反幻觉平滑: 检测到恶意捏造，限制 JD 匹配分上限为 35/60")
 
         # 保留 pre_evaluator 设置的 difficulty_flag，仅作安全网补充
-        existing_flag = state.get("difficulty_flag", "")
+        existing_flag = state.get("difficulty_flag") or ""
         difficulty_flag = existing_flag
         node_status = ""
 

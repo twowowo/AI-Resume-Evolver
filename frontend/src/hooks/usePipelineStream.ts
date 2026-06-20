@@ -14,6 +14,8 @@
 
 import { useState, useRef, useCallback } from "react";
 import { parseSSEStream } from "@/lib/sse-parser";
+import { streamRequest } from "@/lib/api";
+import { useAuth } from "@/contexts/AuthContext";
 import type {
   RadarInitFrame,
   ResumeStreamFrame,
@@ -30,12 +32,15 @@ const INITIAL_STATE: PipelineStreamState = {
   questions: [],
   monologue: "",
   scoreImprovement: 0,
+  displayScoreChange: true,
+  circuitBreakerTriggered: false,
   sessionId: "",
   error: null,
   visualPayload: null,
 };
 
 export function usePipelineStream() {
+  const { user } = useAuth();
   const [state, setState] = useState<PipelineStreamState>(INITIAL_STATE);
   const [isStreaming, setIsStreaming] = useState(false);
   const [isGenerated, setIsGenerated] = useState(false);
@@ -52,28 +57,17 @@ export function usePipelineStream() {
       setState(INITIAL_STATE);
 
       try {
-        const response = await fetch(
-          "http://127.0.0.1:8001/api/v1/resume/optimize",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${localStorage.getItem("resume_auth_token") ?? ""}`,
-            },
-            body: JSON.stringify({
-              resume_text: resumeText,
-              jd_text: jdText,
-              mode: "one_click",
-              user_id: "default_user",     // v4.2 演示期默认值，后续从 auth context 注入
-              resume_id: "default_resume", // v4.2 演示期默认值，后续从文件 Hash 动态计算
-            }),
-            signal: controller.signal,
-          }
-        );
-
-        if (!response.ok) {
-          throw new Error(`后端返回 ${response.status}`);
-        }
+        const response = await streamRequest("/api/v1/resume/optimize", {
+          method: "POST",
+          body: JSON.stringify({
+            resume_text: resumeText,
+            jd_text: jdText,
+            mode: "one_click",
+            user_id: user?.username ?? "",
+            resume_id: "default_resume",
+          }),
+          signal: controller.signal,
+        });
 
         if (!response.body) {
           throw new Error("后端未返回 ReadableStream body");
@@ -116,6 +110,8 @@ export function usePipelineStream() {
                 questions: d.stress_test_questions,
                 monologue: d.internal_monologue,
                 scoreImprovement: d.score_improvement,
+                displayScoreChange: d.display_score_change ?? true,
+                circuitBreakerTriggered: d.circuit_breaker_triggered ?? false,
                 sessionId: d.session_id,
                 visualPayload: d.visual_payload ?? prev.visualPayload,
               }));

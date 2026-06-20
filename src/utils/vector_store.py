@@ -2,13 +2,12 @@ import os
 import re
 import chromadb
 from chromadb.config import Settings
-from chromadb.utils import embedding_functions
 from langchain_chroma import Chroma
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
 
-from src.config import CHROMA_PERSIST_DIR, COLLECTION_NAME
+from src.config import CHROMA_PERSIST_DIR, COLLECTION_NAME, get_vector_db_client
 
 _embedding_model = None
 _vector_store = None
@@ -16,34 +15,49 @@ _bm25_index = None
 _bm25_corpus = None
 _enhanced_retriever = None
 
+_HF_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "models", "huggingface")
+
 
 def _get_embedding_model():
     global _embedding_model
     if _embedding_model is None:
-        _chroma_ef = embedding_functions.DefaultEmbeddingFunction()
+        os.makedirs(_HF_CACHE_DIR, exist_ok=True)
+        os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+        os.environ.setdefault("HF_HUB_CACHE", _HF_CACHE_DIR)
 
-        class _ChromaEmbeddingWrapper:
+        from sentence_transformers import SentenceTransformer
+
+        _BGE_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+
+        class _BGEZhEmbeddingWrapper:
+            def __init__(self):
+                self._model = SentenceTransformer(
+                    "BAAI/bge-large-zh-v1.5",
+                    cache_folder=_HF_CACHE_DIR,
+                )
+
             def embed_documents(self, texts):
-                return _chroma_ef(texts)
+                return self._model.encode(texts, normalize_embeddings=True).tolist()
 
             def embed_query(self, text):
-                return _chroma_ef([text])[0]
+                return self._model.encode(
+                    _BGE_QUERY_INSTRUCTION + text, normalize_embeddings=True
+                ).tolist()
 
-        _embedding_model = _ChromaEmbeddingWrapper()
-        print("[vector_store] ONNX Embedding (all-MiniLM-L6-v2, 384d) 已就绪")
+        _embedding_model = _BGEZhEmbeddingWrapper()
+        print("[vector_store] BAAI/bge-large-zh-v1.5 (1024d) 已就绪")
     return _embedding_model
 
 
 def get_vector_store() -> Chroma:
     global _vector_store
     if _vector_store is None:
-        os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
-        print(f"[vector_store] 本地 ChromaDB 持久化路径 (来自 config 锁): {CHROMA_PERSIST_DIR}")
-
-        client = chromadb.PersistentClient(
-            path=CHROMA_PERSIST_DIR,
-            settings=Settings(anonymized_telemetry=False),
-        )
+        client = get_vector_db_client()
+        chroma_host = os.getenv("CHROMA_HOST", "")
+        if chroma_host:
+            print(f"[vector_store] 远程 ChromaDB: http://{chroma_host}:{os.getenv('CHROMA_PORT', '8000')}")
+        else:
+            print(f"[vector_store] 本地 ChromaDB 持久化路径: {CHROMA_PERSIST_DIR}")
 
         # v4.1: 始终使用 get_or_create 确保 collection 物理存在
         client.get_or_create_collection(name=COLLECTION_NAME)
@@ -115,33 +129,115 @@ def _get_bm25_corpus():
     return _bm25_corpus or []
 
 
-def hybrid_retrieve(query: str, vector_k: int = 10, bm25_k: int = 10, fusion_k: int = 5, metadata_filter: dict | None = None) -> list[Document]:
-    """v4.2 混合检索：支持元数据硬过滤，阻断裂缝式跨租户数据泄露"""
+def _build_scoped_bm25(metadata_filter: dict):
+    """v5.6 为带元数据过滤的查询构建隔离 BM25 索引（不污染全局缓存）。
+
+    返回 (bm25_model, original_texts) 元组。
+    original_texts 保持与 BM25 内部索引顺序一致，供 RRF 融合时按位查找原始文档。
+    """
     store = get_vector_store()
+    try:
+        data = store._collection.get(where=metadata_filter, include=["documents"])
+    except Exception:
+        return None, []
+    docs = data.get("documents", [])
+    if not docs:
+        return None, []
+    corpus = [_tokenize(d) for d in docs]
+    return BM25Okapi(corpus), docs  # docs 保持原始文本用于 RRF 键匹配
+
+
+def _bm25_fallback(query: str, bm25_k: int = 10, metadata_filter: dict | None = None) -> list[Document]:
+    """v5.9 ChromaDB 不可用时 BM25-only 降级检索，系统不崩"""
+    try:
+        if metadata_filter:
+            bm25, bm25_original_texts = _build_scoped_bm25(metadata_filter)
+            bm25_corpus_ref = None
+        else:
+            bm25 = _get_bm25()
+            bm25_corpus_ref = _get_bm25_corpus()
+            bm25_original_texts = []
+    except Exception:
+        return []
+
+    if bm25 is None:
+        return []
+
+    query_tokens = _tokenize(query)
+    bm25_scores = bm25.get_scores(query_tokens)
+    indexed = list(enumerate(bm25_scores))
+    indexed.sort(key=lambda x: x[1], reverse=True)
+
+    docs: list[Document] = []
+    if metadata_filter:
+        for rank, (idx, score) in enumerate(indexed[:bm25_k]):
+            if idx < len(bm25_original_texts):
+                docs.append(Document(page_content=bm25_original_texts[idx]))
+    elif bm25_corpus_ref:
+        for rank, (idx, score) in enumerate(indexed[:bm25_k]):
+            if idx < len(bm25_corpus_ref):
+                docs.append(Document(page_content=bm25_corpus_ref[idx]))
+
+    print(f"[vector_store] BM25-only fallback 完成: {len(docs)} 篇文档")
+    return docs
+
+
+def hybrid_retrieve(query: str, vector_k: int = 10, bm25_k: int = 10, fusion_k: int = 5, metadata_filter: dict | None = None) -> list[Document]:
+    """v5.6 混合检索：向量搜索 + BM25 双路均应用 metadata where 硬过滤。
+
+    当 metadata_filter 为 None（共享种子数据/通用知识库检索）时使用全局缓存 BM25。
+    当 metadata_filter 非空（per-user 隔离检索）时，BM25 在过滤后的文档子集上临时构建，
+    确保隐私碎片不会通过 BM25 通路泄漏到其他租户的 RRF 融合结果中。
+    """
+    # ── v5.9 异常沙箱：ChromaDB 网络抖动时优雅降级为 BM25-only ──
+    try:
+        store = get_vector_store()
+    except Exception as e:
+        print(f"[vector_store] ChromaDB 不可达: {e}，降级为 BM25-only")
+        return _bm25_fallback(query, bm25_k, metadata_filter)
 
     search_kwargs: dict = {"k": vector_k}
     if metadata_filter:
         search_kwargs["filter"] = metadata_filter
 
-    vector_results = store.similarity_search_with_score(query, **search_kwargs)
+    try:
+        vector_results = store.similarity_search_with_score(query, **search_kwargs)
+    except Exception as e:
+        print(f"[vector_store] 向量检索异常: {e}，降级为 BM25-only")
+        return _bm25_fallback(query, bm25_k, metadata_filter)
     vector_ranked: dict[str, float] = {}
     for rank, (doc, score) in enumerate(vector_results):
         vector_ranked[doc.page_content] = rank + 1
 
-    bm25 = _get_bm25()
-    bm25_corpus = _get_bm25_corpus()
+    # ── v5.6: BM25 隔离 ──
+    if metadata_filter:
+        bm25, bm25_original_texts = _build_scoped_bm25(metadata_filter)
+        bm25_corpus = None  # scoped 模式无需全局缓存
+    else:
+        bm25 = _get_bm25()
+        bm25_corpus = _get_bm25_corpus()
+        bm25_original_texts = []
+
     bm25_ranked: dict[str, float] = {}
 
-    if bm25 is not None and bm25_corpus:
+    if bm25 is not None:
         query_tokens = _tokenize(query)
         bm25_scores = bm25.get_scores(query_tokens)
         indexed = list(enumerate(bm25_scores))
         indexed.sort(key=lambda x: x[1], reverse=True)
-        all_docs = store._collection.get(include=["documents"])
-        all_texts = all_docs.get("documents", [])
-        for rank, (idx, score) in enumerate(indexed[:bm25_k]):
-            if idx < len(all_texts):
-                bm25_ranked[all_texts[idx]] = rank + 1
+
+        if metadata_filter:
+            # 使用过滤后文档的原始文本
+            for rank, (idx, score) in enumerate(indexed[:bm25_k]):
+                if idx < len(bm25_original_texts):
+                    bm25_ranked[bm25_original_texts[idx]] = rank + 1
+        else:
+            # 全局缓存路径：从 ChromaDB 按位取回原始文本
+            all_docs = store._collection.get(include=["documents"])
+            all_texts = all_docs.get("documents", [])
+            for rank, (idx, score) in enumerate(indexed[:bm25_k]):
+                if idx < len(all_texts):
+                    bm25_ranked[all_texts[idx]] = rank + 1
 
     rrf_scores: dict[str, float] = {}
     k = 60
@@ -204,3 +300,110 @@ def rebuild_bm25():
     _bm25_index = None
     _bm25_corpus = None
     _build_bm25()
+
+
+def reset_vector_store():
+    """删除并重建 ChromaDB Collection — Embedding 模型升级时维度对齐
+
+    当切换 Embedding 模型导致向量维度变化时（如 384d → 1024d），
+    旧 collection 中的向量记录与新模型维度不匹配，ChromaDB 会拒绝写入。
+    此函数清除旧 collection 并创建新的空 collection。
+    """
+    client = get_vector_db_client()
+    try:
+        client.delete_collection(name=COLLECTION_NAME)
+        print(f"[vector_store] 已删除旧 Collection '{COLLECTION_NAME}' (维度变更: 384d → 1024d)")
+    except Exception:
+        print(f"[vector_store] Collection '{COLLECTION_NAME}' 不存在，跳过删除")
+
+    client.get_or_create_collection(name=COLLECTION_NAME)
+    print(f"[vector_store] 已创建新 Collection '{COLLECTION_NAME}' (BAAI/bge-large-zh-v1.5, 1024d)")
+
+
+# ═══════════════════════════════════════════════════════════════
+# v6.0 Cross-Encoder 重排序 — BAAI/bge-reranker-large
+# ═══════════════════════════════════════════════════════════════
+
+_reranker_model = None
+_RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-large")
+
+
+def _get_reranker():
+    """懒加载 BAAI/bge-reranker-large Cross-Encoder，全进程单例
+
+    模型缓存路径: <项目根>/models/huggingface/
+    设置 HF_HOME 环境变量确保 sentence_transformers / huggingface_hub
+    将模型下载到项目本地目录而非系统默认 ~/.cache/huggingface。
+    首次运行自动下载，后续复用缓存。
+    """
+    global _reranker_model
+    if _reranker_model is None:
+        os.makedirs(_HF_CACHE_DIR, exist_ok=True)
+        os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+        os.environ.setdefault("HF_HUB_CACHE", _HF_CACHE_DIR)
+
+        from sentence_transformers import CrossEncoder
+
+        print(f"[vector_store] 加载 Cross-Encoder: {_RERANKER_MODEL_NAME}")
+        print(f"[vector_store] HF_HOME={os.environ['HF_HOME']}")
+        _reranker_model = CrossEncoder(
+            _RERANKER_MODEL_NAME,
+            max_length=512,
+        )
+        print(f"[vector_store] Cross-Encoder 已就绪")
+    return _reranker_model
+
+
+def cross_encoder_rerank(
+    query: str,
+    documents: list[Document],
+    top_k: int = 10,
+) -> list[Document]:
+    """Cross-Encoder 成对打分重排序 — BAAI/bge-reranker-large
+
+    对每个 (query, doc.page_content) 做 Cross-Attention 推理，
+    按相关性分数降序排列，取 top_k。
+
+    防御:
+      - 文档数不足 top_k 时直接返回原始顺序
+      - 空列表直接返回 []
+      - 单文档跳过推理直接返回
+    """
+    if not documents:
+        return []
+    if len(documents) <= top_k:
+        return documents
+
+    reranker = _get_reranker()
+
+    # 截断过长文本，单篇最多 400 字符提速
+    doc_texts = [doc.page_content[:400] for doc in documents]
+
+    # 构建 (query, document) 对
+    pairs = [(query[:512], text) for text in doc_texts]
+
+    scores = reranker.predict(pairs, show_progress_bar=False)
+
+    # 按分数降序排列
+    scored = list(zip(documents, scores))
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    return [doc for doc, _ in scored[:top_k]]
+
+
+def warmup_reranker() -> bool:
+    """容器启动预热: 强制加载 Cross-Encoder 模型到内存
+
+    供 RetrieverNode.__init__ 或 FastAPI lifespan 调用，
+    将模型首次加载延迟从"首个请求"转移到"启动阶段"。
+
+    Returns:
+        True  预热成功，后续 cross_encoder_rerank() 调用即时可用
+        False 预热失败，系统应自动回退到纯 RRF 融合模式
+    """
+    try:
+        _get_reranker()
+        return True
+    except Exception as e:
+        print(f"[vector_store] Cross-Encoder 预热失败: {type(e).__name__}: {e}")
+        return False

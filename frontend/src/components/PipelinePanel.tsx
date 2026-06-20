@@ -48,9 +48,13 @@ export default function PipelinePanel({
             {isStreaming
               ? "⏳ 全链路流式生成中..."
               : isGenerated
-              ? `✅ 优化完成 · 提升 +${state.scoreImprovement} 分`
+              ? state.circuitBreakerTriggered
+                ? "⚠️ 优化完成 · 技术栈差距较大，建议针对性提升"
+                : `✅ 优化完成 · 提升 +${state.scoreImprovement} 分`
               : hasResult
-              ? `提升 +${state.scoreImprovement} 分`
+              ? state.circuitBreakerTriggered
+                ? "⚠️ 技术栈差距较大"
+                : `提升 +${state.scoreImprovement} 分`
               : "等待左侧输入点火..."}
           </p>
         </div>
@@ -120,12 +124,33 @@ export default function PipelinePanel({
                 {radar.total_score}
               </span>
               <span className="text-sm text-zinc-500"> / 100</span>
-              {state.scoreImprovement > 0 && (
-                <span className="ml-2 text-sm font-semibold text-emerald-600">
+              {state.circuitBreakerTriggered ? (
+                <span className="ml-2 text-sm font-semibold text-amber-600 dark:text-amber-400">
+                  ⚠️ 熔断
+                </span>
+              ) : state.scoreImprovement > 0 && state.displayScoreChange ? (
+                <span className="ml-2 text-sm font-semibold text-emerald-600 dark:text-emerald-400">
                   +{state.scoreImprovement}
                 </span>
-              )}
+              ) : null}
             </div>
+
+            {/* v5.4 信任熔断提示卡 */}
+            {state.circuitBreakerTriggered && (
+              <div className="mt-3 rounded-lg border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/30 p-3 animate-in fade-in">
+                <div className="flex items-start gap-2">
+                  <span className="text-lg shrink-0">🛡️</span>
+                  <div>
+                    <p className="text-xs font-bold text-amber-800 dark:text-amber-200 mb-1">
+                      系统提示：已触发体验熔断保护
+                    </p>
+                    <p className="text-xs text-amber-700 dark:text-amber-300 leading-relaxed">
+                      当前简历与目标 JD 存在明显的技术栈脱节，系统已尽力优化表达，但核心硬实力差距较大，建议针对性提升相关技术、多积累项目经验后再尝试对齐。
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 

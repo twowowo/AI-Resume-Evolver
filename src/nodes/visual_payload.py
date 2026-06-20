@@ -46,9 +46,11 @@ _SKILL_LINE_RE = re.compile(
 _SECTION_HEADING_RE = re.compile(r"^##\s+(.+)$", re.MULTILINE)
 
 # ── 需要从 main_resume_markdown 中移除的模块标题关键词 ──
+# 注：v5.3 起"核心技术栈/技能"不再从此处剥离，
+# 前端 A4PaperPreview 通过 ReactMarkdown 直接渲染完整的技能 Markdown，
+# 不再使用蓝色 Pill 标签。仅剥离"个人信息"模块（已由 Header 区渲染）。
 _STRIP_SECTION_KEYWORDS = [
     "个人基础信息", "个人信息", "基本信息", "个人资料",
-    "核心技术栈", "技能特长", "专业技能", "技术能力", "技能",
 ]
 
 # ── 裸奔 ** 残留清洗 ──

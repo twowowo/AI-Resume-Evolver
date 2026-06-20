@@ -1,0 +1,150 @@
+
+
+## Harvested from https://raw.githubusercontent.com/donnemartin/system-design-primer/master/solutions/system_design/scaling_aws/README.md at 2026-06-20 13:13:22 UTC [via Mode B (知识→工程实践合成)]
+[水平扩展] 从单机垂直扩容到水平扩展的架构演进实践
+- Situation: 初创社交平台用户从100增长到10万，单台EC2实例CPU持续100%，MySQL连接池耗尽导致502错误频发，垂直扩容至r5.24xlarge月成本超$7k仍无法满足高峰
+- Task: 设计可独立扩展且具备故障转移能力的架构，支撑日均100万请求，P99延迟＜200ms，同时控制成本增长在3倍以内
+- Action: 引入ELB进行流量分发，部署2组Web服务器跨可用区（active-active），将MySQL迁移至RDS多AZ并配置主从复制，将静态资源（图片/JS/CSS）迁移至S3+CloudFront CDN，Web层无状态化支持水平伸缩
+- Result: 支持从100到10万用户平滑扩展，高峰期QPS从200提升至8000（估算），P99延迟从3s降至120ms（估算），月成本从$7k降至$4.5k（购买预留实例后）（估算）
+
+[缓存策略] ElastiCache在千万级读负载下的多层缓存落地
+- Situation: 社交信息流服务日均1亿读请求，MySQL主库CPU 95%，从库复制延迟超10秒，缓存穿透导致雪崩风险
+- Task: 读写比例100:1，需要将数据库读QPS降低90%以上，P99延迟＜50ms，同时防范缓存击穿/雪崩
+- Action: 采用ElastiCache (Redis) 实现Cache-Aside模式，热点数据（用户信息、热门帖子）缓存TTL设置为15分钟+随机偏移±3分钟；对空值进行缓存（1分钟短TTL）防穿透；使用Redis集群分片支持80GB缓存容量；配合DB查询结果异步回填机制
+- Result: 数据库读QPS下降92%（估算），P99延迟从800ms降至35ms（估算），缓存命中率稳定在98.5%以上
+
+[数据库扩展] MySQL读写分离+只读副本在千万用户场景下的工程化
+- Situation: 电商订单系统高峰期写入400TPS，读取40000QPS，单一RDS主节点CPU打满，从库因复制延迟导致读取脏数据
+- Task: 实现读写分离，写入可靠，读取水平扩展，保证最终一致性窗口＜5秒
+- Action: 部署3个MySQL Read Replica在多个可用区，修改Web层代码分离读写路由（写走主库，读走从库）；在从库前添加ELB实现负载均衡；对非实时读请求允许从库延迟，实时读（如支付结果）强制走主库；使用ProxySQL中间件管理连接池与读写分离
+- Result: 主库CPU从95%降至45%（估算），从库承载3万QPS无压力，复制延迟稳定在2-3秒内，系统可用性从99.9%提升至99.99%（估算）
+
+[自动伸缩] AWS Auto Scaling实现成本优化的弹性算力调度
+- Situation: 社交直播平台流量呈明显潮汐特征（晚8-11点高峰流量是白天5倍，周末活动瞬时流量激增15倍），固定集群白天资源浪费严重，晚高峰又频繁触发限流
+- Task: 实现Web层和Worker层的自动伸缩，降低40%闲时成本，同时确保高峰扩容时间＜5分钟
+- Action: 使用AWS Auto Scaling组：Web服务器基于CPU+请求数组合指标（CPU＞60%或并发请求＞2000触发扩容；＜30%缩容）；Application Worker基于SQS队列深度（队列长度＞1000条扩容实例）；设置最小2台、最大50台，冷却时间120秒；配合CloudWatch Scheduled Scaling预判高峰时段提前扩容
+- Result: 闲时成本降低62%（估算），高峰扩容至40台实例仅需3分20秒（估算），无一次限流事件，月账单节省$12,000（估算）
+
+[异步处理] 消息队列解耦图片处理任务提升系统吞吐
+- Situation: 图片分享应用用户上传原图（平均2MB），服务端需生成3种缩略图并写入S3+更新DB，同步处理导致上传接口耗时超5秒，用户等待体验差
+- Task: 将耗时的图片处理异步化，上传接口P99延迟＜500ms，处理能力支持每秒400张上传峰值
+- Action: 上传请求仅将图片元数据写入DB并存入S3，然后将处理任务（含原图路径、尺寸参数）放入SQS队列；Worker实例（EC2上运行ImageMagick）从队列拉取任务，生成缩略图后写回S3并更新DB状态；设置DLQ处理失败任务，Worker自动伸缩基于队列深度
+- Result: 上传接口P99延迟从5s降至380ms（估算），系统支持峰值600TPS处理能力（估算），图片处理失败率从5%降至0.5%（估算）
+
+[安全隔离] 多层VPC网络隔离与安全组配置实践
+- Situation: 金融科技公司需通过PCI-DSS合规，之前所有服务部署在同一子网，内部攻击能横向移动，且公网暴露端口过多
+- Task: 构建最小权限网络模型，禁止非必要公网访问，实现数据库和缓存完全私有化
+- Action: 创建VPC划分公共子网（仅Web/ELB）和私有子网（App/RDS/ElastiCache）；安全组规则：ELB允许0.0.0.0/0的80/443，Web仅允许ELB的安全组，RDS仅允许App安全组，ElastiCache同理；SSH仅允许堡垒机（跳板机）IP；开启VPC Flow Logs审计；使用AWS KMS对S3/RDS/EBS加密
+- Result: 通过PCI-DSS Level 1认证（估算），攻击面减少90%（估算），内部横向移动风险消除，安全审计事件下降至零违规（估算）
+
+[SQL扩展] 数据库分片（Sharding）解决单表10亿行性能瓶颈
+- Situation: 物联网平台设备上报数据表月增2亿行，单表达到200GB，查询按设备ID的时间范围超5秒，索引维护成本高
+- Task: 水平拆分数据，保证跨分片查询延迟＜1秒，扩容时数据迁移对业务无感
+- Action: 选择设备ID作为分片键，使用一致性哈希算法分为64个逻辑分片映射到4个RDS实例（每实例16分片）；应用层通过ShardingSphere中间件路由写请求；读请求支持指定分片ID或广播查询（限制次数）；预先分配预留分片用于未来扩容；数据迁移使用AWS DMS不停机同步
+- Result: 单查询延迟从5.2s降至85ms（估算），支持每秒10万写入（估算），数据量增长至500GB无性能退化，扩容至8实例时零停机（估算）
+
+[CDN加速] 静态资源CDN + Origin Shield降低回源压力的工程实践
+- Situation: 全球游戏更新包分发，玩家平均下载速度仅1.2MB/s，带宽成本每月$50k，回源站（S3）高峰被DDoS流量打穿
+- Task: 提升全球下载速度至5MB/s以上，降低回源带宽90%，抵御CC攻击
+- Action: 使用CloudFront CDN，配置多个地区边缘节点；开启Origin Shield功能减少对S3的重复请求；设置缓存策略：更新包缓存7天，热更新缓存1小时，使用Versioned URLs强制刷新；启用AWS WAF关联CloudFront，配置速率限制和恶意IP黑名单；S3仅允许CloudFront OAI访问
+- Result: 全球平均下载速度提升至8.3MB/s（估算），回源带宽下降97%（估算），带宽成本从$50k降至$4k（估算），成功抵御3次DDoS攻击（估算）
+
+
+## Harvested from https://raw.githubusercontent.com/donnemartin/system-design-primer/master/solutions/system_design/pastebin/README.md at 2026-06-20 13:13:41 UTC [via Mode B (知识→工程实践合成)]
+[短链接生成] 基于MD5+Base62的短链接生成策略在内容分享平台的落地
+- Situation: 需要为每月1000万次文本粘贴生成唯一短链接，要求7字符长度且无冲突，同时支持可选的过期时间
+- Task: 设计一种高效、冲突率低的短链接生成算法，确保62^7空间内3年内360M链接不重复
+- Action: 采用用户IP+时间戳的MD5哈希，取前7个字符进行Base62编码，写入MySQL前先检查唯一性；若冲突则重新生成；使用`shortlink`列作为主键并建索引
+- Result: 生成耗时平均<1ms（估算），冲突率低于0.01%（估算），支撑3年360M条记录无重复
+
+[存储架构] 对象存储+关系数据库分层存储方案在内容托管中的实践
+- Situation: 每月新增12.7GB文本内容，3年积累450GB，需持久化且支持高并发读取（40 QPS平均）
+- Task: 平衡存储成本与访问延迟，避免单点文件服务器瓶颈
+- Action: 将粘贴内容存入Amazon S3对象存储，元数据（shortlink、过期时间、路径）存MySQL；读取时先查库获取路径，再从S3拉取内容
+- Result: 存储成本降低60%（估算），读取P99延迟控制在80ms（估算），无需维护文件服务器集群
+
+[数据库索引] 基于主键和排序索引的查询优化在过期清理场景的应用
+- Situation: 需要定期扫描并删除过期粘贴记录，全表扫描导致数据库IO压力大
+- Task: 设计索引加速过期查询，减少磁盘扫描
+- Action: 在`created_at`列上建二级索引，清理SQL使用`SELECT shortlink FROM pastes WHERE created_at < NOW() - INTERVAL expiration_length_in_minutes MINUTE`利用索引；同时将热点索引页常驻内存
+- Result: 过期清理耗时从分钟级降至秒级（估算），磁盘读次数减少80%（估算）
+
+[离线分析] MapReduce日志分析模式在月度页面访问统计中的实践
+- Scene: 不需要实时分析，但需要按url和月份统计点击量，日志量每月约1亿条
+- Task: 设计一个低成本、可扩展的分析管道，支持批量聚合
+- Action: 使用MapReduce框架（如Hadoop）处理Web服务器日志，Mapper提取(url,年月)对并发射1，Reducer求和；结果存入分析数据库（如Redshift）
+- Result: 每月统计任务2小时内完成（估算），硬件成本仅为实时流处理的30%（估算）
+
+[缓存策略] 内存缓存+读副本分级缓存架构应对热点粘贴的流量峰值
+- Situation: 40平均读取QPS下，热点内容导致数据库读副本负载不均衡，缓存穿透时有发生
+- Task: 降低数据库读取压力，应对突发流量
+- Action: 引入Redis内存缓存（Cache-Aside模式），对热数据缓存10分钟；未命中时查询MySQL只读副本，回填缓存并设随机TTL防雪崩；只读副本采用主从复制分担查询
+- Result: 数据库读QPS降低70%（估算），缓存命中率达85%（估算），P99延迟从150ms降至30ms（估算）
+
+[数据清理] 定时任务+软删除模式在粘贴过期处理中的工程实践
+- Situation: 每月约30%的粘贴会在创建后30天内过期，需高效清理并释放对象存储空间
+- Task: 避免全量扫描且保证数据一致性，支持回滚
+- Action: 后台定时任务（每10分钟）扫描数据库过期记录，先标记为“已过期”而非直接删除（软删除），再异步批量删除S3对象和数据库行；设置监控告警阈值
+- Result: 数据清理成功率100%（估算），误删回滚时间<5分钟（估算），对象存储垃圾数据占比低于5%（估算）
+
+[系统扩展] 读写分离+分库分表架构在高并发粘贴写入场景的迭代演进
+- Situation: 单库写入瓶颈，平均4QPS但峰值可达40QPS，未来3年数据量增长10倍
+- Task: 设计可水平扩展的持久化层，保证写入不丢数据且读取线性扩展
+- Action: 第一阶段采用MySQL主写+多从读复制；第二阶段按shortlink哈希分片（32分片），写请求路由到对应分片主库；引入消息队列异步写入对象存储
+- Result: 写吞吐量提升32倍（估算），读取延迟保持稳定，分片后单库负载降低90%（估算）
+
+[高可用] 多级负载均衡+CDN加速在内容分发场景的架构设计
+- Situation: 全球用户访问，单区域Web服务器故障导致服务不可用，且静态资源加载慢
+- Task: 实现99.99%可用性，全球平均页面加载时间<1s
+- Action: 部署多机房DNS负载均衡，前端加Nginx反向代理集群；静态资源（如paste内容预览）接入CDN；API服务器无状态化，通过服务发现自动扩缩容
+- Result: 年度可用性达99.995%（估算），全球P50加载时间从1.2s降至0.4s（估算），故障自动切换时间<10s（估算）
+
+
+## Harvested from https://raw.githubusercontent.com/donnemartin/system-design-primer/master/solutions/system_design/twitter/README.md at 2026-06-20 13:14:02 UTC [via Mode B (知识→工程实践合成)]
+[社交Feed] Fan-out推模式在微博发推场景的工程落地
+- Situation: 用户发推后需要将推文实时推送给所有粉丝，粉丝量级达百万，直接同步写数据库导致写放大和延迟飙升
+- Task: 实现高吞吐的推文分发，发推P99延迟 < 500ms，同时保证粉丝时间线可见性
+- Action: 采用Fan-out推模式，使用Redis列表存储每个粉丝主页时间线的tweet_id（8字节）+user_id（8字节）+meta（1字节），发推时异步通过Fanout Service查询粉丝列表（Memory Cache），批量写入Redis；同时使用消息队列异步发送通知
+- Result: 发推P99延迟从3s降至200ms（估算），每天支撑60k TPS的推文扇出（估算）
+
+[缓存设计] 主页时间线Redis列表存储与多get读取优化
+- Situation: 主页时间线读取QPS达10万，每次需拉取最近数百条推文并关联用户信息，直接查DB导致高延迟
+- Task: 将时间线查询P99延迟控制在50ms以内，降低DB读负载
+- Action: 使用Redis列表存储时间线（按时间倒序），每个元素仅存tweet_id和user_id；读取时通过Timeline Service O(1)获取列表，再通过Tweet Info Service和User Info Service分别做multiget批量查询推文详情和用户信息
+- Result: 主页时间线P99从800ms降至35ms（估算），数据库读QPS下降90%（估算）
+
+[搜索系统] Lucene集群scatter-gather搜索架构实践
+- Situation: 用户搜索推文请求量4000 QPS，需要支持全文检索、纠错、布尔查询，且延迟需<200ms
+- Task: 构建高可用低延迟的搜索集群，支持分词、拼写纠错、结果合并排序
+- Action: 使用Lucene构建搜索集群，查询时对每个分片做scatter gather，服务端完成tokenize、去除标点、纠错、归一化、布尔转换，合并并排序返回结果
+- Result: 搜索P99延迟150ms（估算），吞吐量支撑10亿次/月搜索（估算）
+
+[写优化] 大V用户Fan-out延迟补偿与混合拉模式
+- Situation: 拥有千万粉丝的大V发推时，Fan-out需要写千万级Redis列表，耗时数分钟，导致@回复出现竞态条件
+- Task: 避免大V推文fanout阻塞，同时保证时间线一致性
+- Action: 对大V用户采用延迟fanout：仅将推文放入其本人时间线，普通用户时间线通过查询时合并搜索结果（拉模式）获取大V推文，在serve端重新排序；同时写入时保留@回复的时间戳用于重排
+- Result: 大V发推延迟从分钟级降至<1s（估算），时间线一致性通过serve端排序保证
+
+[冷启动] 非活跃用户时间线冷重建策略
+- Situation: 每月有大量非活跃用户（30天未登录）占内存缓存，若缓存所有用户时间线导致Redis内存爆炸
+- Task: 节省缓存资源，同时保证用户登录后快速恢复时间线
+- Action: 仅缓存活跃用户（30天内有登录）的主页时间线，每个用户保留最近数百条；非活跃用户登录时，通过User Graph Service获取关注列表，从SQL Database拉取推文填充到Redis Cache
+- Result: 缓存内存使用减少60%（估算），冷用户恢复时间线P99为800ms（估算）
+
+[数据库扩展] 推送场景下SQL写主库分片与NoSQL迁移
+- Situation: 推文写入量达6000 TPS，单SQL写主库成为瓶颈，且存储3年数据达5.4PB
+- Task: 水平扩展写入能力，支持PB级存储
+- Action: 对推文数据库采用分片（按user_id hash），并部分迁移至NoSQL（如Cassandra）以提升写入吞吐；同时保留SQL用于用户时间线等关系型查询，使用主从复制+故障转移
+- Result: 写入吞吐提升至2万 TPS（估算），存储成本降低30%（估算）
+
+[媒体存储] 推文媒体对象存储与CDN加速
+- Situation: 推文平均10KB媒体（图片/视频），每月新增150TB，直接存储在应用服务器导致带宽瓶颈和存储不均
+- Task: 高可用、低成本的媒体存储方案，同时加速全球访问
+- Action: 将媒体上传至对象存储（如S3），通过CDN分发；API返回媒体URL，客户端直接从CDN加载；写入时通过异步队列处理缩略图生成
+- Result: 媒体请求延迟降低70%（估算），存储成本节省50%（估算），应用服务器带宽压力下降90%（估算）
+
+[异步处理] 通知推送的异步消息队列解耦
+- Situation: 发推后需要向粉丝发送push notification和email，若同步处理会阻塞发推主流程
+- Task: 解耦通知发送，保证发推低延迟
+- Action: 引入消息队列（如Kafka），Fanout Service将通知任务写入队列，由Notification Service消费并异步发送push和email，支持背压控制
+- Result: 发推P99延迟降低90%（估算），通知系统可独立扩展，支撑每日5亿条推送（估算）

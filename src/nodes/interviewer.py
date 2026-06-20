@@ -115,9 +115,9 @@ def interviewer_node(state: AgentState):
     输入：revised_resume (优化后简历), jd (目标岗位)
     输出：stress_test_questions (压测题列表)
     """
-    revised_resume = state.get("revised_resume", "")
-    jd = state.get("jd", "")
-    internal_monologue = state.get("internal_monologue", "")
+    revised_resume = state.get("revised_resume") or ""
+    jd = state.get("jd") or ""
+    internal_monologue = state.get("internal_monologue") or ""
 
     if not revised_resume.strip():
         print("[interviewer] 精修简历为空，跳过压测题生成")

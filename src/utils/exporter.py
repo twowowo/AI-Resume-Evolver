@@ -80,6 +80,9 @@ class _MarkdownBlock:
 
 
 def _parse_markdown(md_content: str) -> list[_MarkdownBlock]:
+    # ── v5.9 None 安全兜底 ──
+    if not md_content or not isinstance(md_content, str):
+        return []
     lines = md_content.strip().split("\n")
     blocks: list[_MarkdownBlock] = []
     pending_list: list[str] = []

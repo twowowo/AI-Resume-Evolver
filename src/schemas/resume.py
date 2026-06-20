@@ -66,11 +66,11 @@ class ResumeOptimizeRequest(BaseModel):
     """简历优化统一请求体 —— v4.2 多租户隔离沙箱"""
 
     resume_text: str = Field(
-        ..., min_length=10, max_length=10000,
+        ..., max_length=10000,
         description="原始简历文本内容"
     )
     jd_text: str = Field(
-        ..., min_length=10, max_length=5000,
+        ..., max_length=5000,
         description="目标岗位 JD 文本内容"
     )
     mode: OptimizeMode = Field(

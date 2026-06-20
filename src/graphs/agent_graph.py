@@ -43,6 +43,12 @@ class AgentState(TypedDict):
     # 工业级状态并网：锁定当前会话操作的原始简历底座，作为只读上下文，防止模型跑飞
     current_resume_markdown: str
 
+    # ── v5.8 多租户隔离字段：从 agent_router 运行时注入，贯穿全链路 ──
+    user_id: str               # JWT 推导的用户全局唯一 ID
+    resume_id: str             # 简历文件标识，锁定记忆沙箱边界
+    step_count: int            # LangGraph 节点迭代步数累计
+    total_tokens: int          # 累计消耗 Token（估算值）
+
 
 # ==========================================
 # 🧠 2. 编写 Agent 大脑节点逻辑

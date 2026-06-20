@@ -8,6 +8,7 @@ v5.2 密码哈希与 JWT Token 工具
 """
 
 import os
+import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, Request, status, Depends
@@ -19,6 +20,9 @@ import bcrypt
 from jose import JWTError, jwt
 
 from src.auth.schemas import UserInfo
+
+logger = logging.getLogger("AuthSecurity")
+logging.basicConfig(level=logging.INFO)
 
 # ── JWT 配置 ──
 JWT_SECRET = os.getenv("JWT_SECRET", "zhoujiankai_jwt_secret_2026")
@@ -98,15 +102,40 @@ async def get_current_user(
         request.state.user = None
         return
 
+    # ── 防御：缺失 Authorization 头 ──
     if credentials is None:
+        logger.warning(
+            "[AuthN] 401 缺少 Bearer Token | path=%s | client=%s",
+            request.url.path,
+            request.client.host if request.client else "unknown",
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="[安全熔断] 缺少 Authorization Bearer Token，请先登录。",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    payload = decode_access_token(credentials.credentials)
+    # ── 防御：Token 为空字符串（前端未登录或 localStorage 被清空）──
+    raw_token = credentials.credentials or ""
+    if not raw_token.strip():
+        logger.warning(
+            "[AuthN] 401 Token 为空字符串 | path=%s | client=%s",
+            request.url.path,
+            request.client.host if request.client else "unknown",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="[安全熔断] Token 为空，请先登录。",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    payload = decode_access_token(raw_token)
     if payload is None:
+        logger.warning(
+            "[AuthN] 401 Token 无效或已过期 | path=%s | token_prefix=%s...",
+            request.url.path,
+            raw_token[:12] if len(raw_token) > 12 else raw_token,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="[安全熔断] Token 无效或已过期，请重新登录。",
@@ -125,6 +154,12 @@ async def get_current_user(
         db_user = session.scalars(stmt).first()
 
     if db_user is None or not db_user.is_active:
+        logger.warning(
+            "[AuthN] 401 用户不存在或已停用 | path=%s | uid=%s | username=%s",
+            request.url.path,
+            user_id,
+            username,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="[安全熔断] 用户不存在或已被停用。",

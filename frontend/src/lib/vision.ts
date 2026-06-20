@@ -5,7 +5,9 @@
  * 后端使用 DeepSeek Vision 模型进行 OCR/视觉推理
  */
 
-const VISION_API = "http://127.0.0.1:8001/api/v1/upload/parse";
+import { API_BASE, getToken, clearAuth } from "./api";
+
+const VISION_PATH = "/api/v1/upload/parse";
 
 const MAX_IMAGE_DIMENSION = 2000;
 const MAX_IMAGE_SIZE_MB = 2;
@@ -98,12 +100,26 @@ export async function analyzeFileToText(file: File): Promise<string> {
   const timeoutId = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
 
   try {
-    const response = await fetch(VISION_API, {
+    const token = getToken();
+    if (!token) {
+      clearAuth();
+      throw new Error("[401] 未登录，请先登录后再上传");
+    }
+
+    const response = await fetch(`${API_BASE}${VISION_PATH}`, {
       method: "POST",
-      headers: { "Authorization": `Bearer ${localStorage.getItem("resume_auth_token") ?? ""}` },
+      headers: { "Authorization": `Bearer ${token}` },
       body: formData,
       signal: controller.signal,
     });
+
+    if (response.status === 401) {
+      clearAuth();
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("auth:expired"));
+      }
+      throw new Error("[401] 认证已失效，请重新登录");
+    }
 
     if (!response.ok) {
       let detail = `服务器返回 ${response.status}`;

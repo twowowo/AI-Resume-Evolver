@@ -41,3 +41,6 @@ class AgentState(TypedDict):
     # ── v4.3 Ragas 影子审计提效计数器 ──
     step_count: int            # LangGraph 节点迭代步数累计
     total_tokens: int          # 累计消耗 Token（估算值）
+    # ── v6.0 RAG Phase 2 工业级全链路重构 ──
+    jd_keywords: str           # 15个核心技术锚点 (由 retriever LLM 提取)，供 editor 【铁律十一】审计
+    retriever_metrics: str     # RAG 检索遥测日志 [RAG Metrics v6.0]

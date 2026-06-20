@@ -268,8 +268,9 @@ def pre_evaluator_node(state: AgentState):
     输入：resume (原始简历), jd
     输出：score, difficulty_flag, dimension_scores, core_tool_overlap, node_status
     """
-    resume = state.get("resume", "")
-    jd = state.get("jd", "")
+    # ── v5.9 None 安全兜底 ──
+    resume = state.get("resume") or ""
+    jd = state.get("jd") or ""
 
     if not resume.strip():
         return {

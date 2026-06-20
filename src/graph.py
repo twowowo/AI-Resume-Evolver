@@ -467,6 +467,8 @@ def run_pipeline(resume: str, jd: str, user_id: str = "default_user", resume_id:
         "visual_payload": {},
         "step_count": 0,
         "total_tokens": 0,
+        "jd_keywords": "",
+        "retriever_metrics": "",
     }
     result = app.invoke(initial)
     return result
@@ -501,6 +503,8 @@ def run_pipeline_stream(resume: str, jd: str, user_id: str = "default_user", res
         "visual_payload": {},
         "step_count": 0,
         "total_tokens": 0,
+        "jd_keywords": "",
+        "retriever_metrics": "",
     }
 
     final = None

@@ -38,11 +38,9 @@ CHAT_EDITOR_SYSTEM_PROMPT = """你是一位精通大模型工程化与简历重�
 3. 物理隔离：必须将最终 Markdown 简历放置在 <clean_resume>...</clean_resume> 标签内。
 4. 三竖线拦截：任何新增或修改的经历头部，必须严格遵循 `时间段 | 机构名称 | 身份` 的格式。
 5. 量化优先：所有补充的新经历，必须包含可量化的指标或成果数据，严禁空洞描述。
-6. 全量输出：输出完整简历全文，不得截断或省略任何已有章节。
+6. 全量输出 + 空模块跳过：输出完整简历全文，但若某模块完全没有实质内容（正文为空或仅"无/暂无"字样），直接跳过该模块，不输出标题和占位文本。
 7. 断点续传：请优先参考【历史会话断点备忘录】中的雷区限制与分数轨迹，避免重复踩坑。
-8. 【v4.6 Ragas 透明化前言】在 <clean_resume> 标签内的 Markdown 正文最开头（第一个 ## 标题之前），必须包含以下声明（使用 > 引用块格式）：
-> **已基于当前岗位 JD 需求完成简历的语义对齐与技术锚点强化，以下是根据您提供的原始项目文档及 JD 要求生成的终稿。**
-该声明绝不可省略。
+8. 【绝对输出禁语令】绝对禁止在输出中附带任何形式的寒暄问候（"好的"、"以下是"、"希望这份简历能帮到您"、祝福语）、Markdown 代码块包裹（``` 标记）、角色扮演评论、署名结语。只输出 <clean_resume> 标签包裹的纯净简历正文。
 """
 
 CHAT_EDITOR_REFINE_PROMPT = """你是一位精通大模型工程化与简历重构的首席全栈专家。
@@ -64,10 +62,9 @@ CHAT_EDITOR_REFINE_PROMPT = """你是一位精通大模型工程化与简历重�
 1. 精准打磨：仅针对评审团反馈中指出的问题进行修改，其他章节保持原样。
 2. 物理隔离：必须将最终 Markdown 简历放置在 <clean_resume>...</clean_resume> 标签内。
 3. 三竖线拦截：任何修改的经历头部，必须严格遵循 `时间段 | 机构名称 | 身份` 的格式。
-4. 全量输出：输出完整简历全文，不得截断或省略任何已有章节。
+4. 全量输出 + 空模块跳过：输出完整简历全文，但若某模块完全没有实质内容（正文为空或仅"无/暂无"字样），直接跳过该模块，不输出标题和占位文本。
 5. 断点续传：请优先参考【历史会话断点备忘录】中的雷区限制与分数轨迹，避免重复踩坑。
-6. 【v4.6 Ragas 透明化前言】在 <clean_resume> 标签内的 Markdown 正文最开头，必须包含以下声明：
-> **已基于当前岗位 JD 需求完成简历的语义对齐与技术锚点强化，以下是根据您提供的原始项目文档及 JD 要求生成的终稿。**
+6. 【绝对输出禁语令】绝对禁止在输出中附带任何形式的寒暄问候、Markdown 代码块包裹（``` 标记）、角色扮演评论、署名结语。只输出 <clean_resume> 标签包裹的纯净简历正文。
 """
 
 
@@ -76,11 +73,11 @@ def chat_editor_node(state: AgentState) -> dict:
 
     新增: conversation_summary 注入，使编辑器具备跨轮次断点续传能力
     """
-    current_resume = state.get("revised_resume") or state.get("resume", "")
-    user_input = state.get("user_supplement", "")
-    jd = state.get("jd", "")
-    eval_feedback = state.get("evaluation_feedback", "")
-    conversation_summary = state.get("conversation_summary", "") or "（首次编辑，暂无历史断点）"
+    current_resume = state.get("revised_resume") or state.get("resume") or ""
+    user_input = state.get("user_supplement") or ""
+    jd = state.get("jd") or ""
+    eval_feedback = state.get("evaluation_feedback") or ""
+    conversation_summary = state.get("conversation_summary") or "（首次编辑，暂无历史断点）"
 
     # ── 无任何输入 → 直接通过 ──
     if not user_input.strip() and not eval_feedback.strip():
@@ -132,11 +129,11 @@ def chat_editor_node(state: AgentState) -> dict:
         return {
             "revised_resume": current_resume,
             "node_status": f"模型调用异常 ({type(e).__name__})，已回退当前简历。",
-            "chat_history": (state.get("chat_history", []) + [
+            "chat_history": (state.get("chat_history") or [] + [
                 {"role": "user", "content": user_input},
                 {"role": "assistant", "content": f"编辑引擎暂时过热，已保留上一版本。错误: {type(e).__name__}"},
-            ]) if user_input.strip() else state.get("chat_history", []),
-            "turn_count": state.get("turn_count", 0) + 1,
+            ]) if user_input.strip() else state.get("chat_history") or [],
+            "turn_count": (state.get("turn_count") or 0) + 1,
             "user_supplement": "",  # 清除已处理的输入
         }
 
@@ -150,7 +147,7 @@ def chat_editor_node(state: AgentState) -> dict:
               f"(响应前200字符: {response_text[:200]})")
 
     # ── 仅在有用户输入时追加对话历史 ──
-    existing_history = state.get("chat_history", [])
+    existing_history = state.get("chat_history") or []
     if user_input.strip():
         existing_history = existing_history + [
             {"role": "user", "content": user_input},

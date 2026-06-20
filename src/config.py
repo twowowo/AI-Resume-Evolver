@@ -75,6 +75,10 @@ def ensure_seed_data() -> int:
         print("[seed_guard] 种子数据为空，跳过灌入。")
         return 0
 
+    # 加载 BGE 1024d 嵌入模型，确保种子数据与系统其他模块维度对齐
+    from src.utils.vector_store import _get_embedding_model
+    embed_fn = _get_embedding_model()
+
     # 批量写入：每批 10 条，逐批 add 并打印进度
     batch_size = 10
     total = len(SEED_TERMS)
@@ -85,7 +89,8 @@ def ensure_seed_data() -> int:
         ids = [f"seed_{i + j:04d}" for j in range(len(batch))]
         metadatas = [{"source": "seed_data", "index": i + j} for j in range(len(batch))]
         try:
-            collection.add(documents=batch, ids=ids, metadatas=metadatas)
+            embeddings = embed_fn.embed_documents(batch)
+            collection.add(documents=batch, embeddings=embeddings, ids=ids, metadatas=metadatas)
             ingested += len(batch)
         except Exception as e:
             print(f"[seed_guard] 批次 [{i}:{i+batch_size}] 写入失败: {e}")

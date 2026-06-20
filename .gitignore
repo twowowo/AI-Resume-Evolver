@@ -13,6 +13,7 @@ data/resumes/~$*
 chroma_db/
 data/resume_state.db
 data/chroma_data/
+models/
 
 # 前端依赖，严禁入库
 frontend/node_modules/

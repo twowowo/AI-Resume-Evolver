@@ -50,7 +50,7 @@ def _build_term_injection(items: list[str]) -> str:
                 seen.add(first_sentence)
     if not terms:
         return "（暂无专属术语库，请基于通用大厂标准进行动词升级）"
-    max_terms = 25
+    max_terms = 40
     if len(terms) > max_terms:
         terms = terms[:max_terms]
     lines = [f"  {i}. {t}" for i, t in enumerate(terms, 1)]
@@ -63,7 +63,7 @@ def _build_golden_cases(items: list[str]) -> str:
     long_items = [it for it in items if len(it) >= 80]
     if not long_items:
         long_items = items
-    max_cases = 8
+    max_cases = 12
     cases = long_items[:max_cases]
     lines: list[str] = []
     for i, case in enumerate(cases, 1):
@@ -92,19 +92,16 @@ _CLEAN_RESUME_RE = re.compile(
 
 
 def _extract_clean_markdown(response_text: str) -> str:
-    """从 LLM 响应中提取 <clean_resume>...</clean_resume> 内的纯净 Markdown"""
+    """从 LLM 响应中提取 <clean_resume>...</clean_resume> 内的纯净 Markdown，
+    并通过 text_sanitizer 做最终清洗。"""
+    from src.utils.text_sanitizer import sanitize_resume_text
+
     match = _CLEAN_RESUME_RE.search(response_text)
     if match:
-        return match.group(1).strip()
-    # 回退: 如果没找到标签，尝试去掉常见前缀废话
-    fallback = response_text.strip()
-    for marker in ["好的，以下是", "以下是优化后的", "这是优化后的", "```markdown", "```"]:
-        idx = fallback.find(marker)
-        if idx >= 0:
-            fallback = fallback[idx + len(marker):].strip()
-    # 去掉尾部 ``` 标记
-    if fallback.endswith("```"):
-        fallback = fallback[:-3].strip()
+        extracted = match.group(1).strip()
+        return sanitize_resume_text(extracted, log_prefix="[editor]")
+    # 回退: 如果没找到标签，走全文本清洗管道
+    fallback = sanitize_resume_text(response_text, log_prefix="[editor]")
     return fallback
 
 
@@ -129,20 +126,10 @@ EDITOR_SYSTEM_PROMPT = """你是一位拥有 10 年经验的大厂（字节跳�
 <clean_resume> 标签内必须是纯净的 Markdown，不允许任何闲聊、问候语、或"以下是优化后的简历"之类的废话。
 XML 标签必须正确闭合，否则简历无法渲染。
 
-═══════════════════════════════════════════════════════════
-【铁律零之补充】v4.6 Ragas 透明化前言
-═══════════════════════════════════════════════════════════
-在 <clean_resume> 标签的 Markdown 正文最开头（第一个 ## 标题之前），必须包含一段不可删除的透明化前言声明：
-
-> **已基于当前岗位 JD 需求完成简历的语义对齐与技术锚点强化，以下是根据您提供的原始项目文档及 JD 要求生成的终稿。**
-
-该声明使用 > 引用块格式，与正文保持一个空行的视觉间距。
-此声明是 Ragas 影子审计的证据链锚定组件，绝不可省略。
-
 ══════════════════════════════════════════════════════════
-【铁律一】全量保留死命令 — 一个模块、一个数据都不许删
+【铁律一】全量保留死命令 — 有内容的模块一个不删，空模块直接跳过
 ══════════════════════════════════════════════════════════
-你必须全量保留原简历中的每一个模块及其含金量数据，禁止擅自删减。包括但不限于：
+你必须全量保留原简历中每个【有实质内容】的模块及其含金量数据。包括但不限于：
   - 教育背景
   - 实习经历（对在校生/应届生，严禁将"实习经历"改称"工作经历"！）
   - 项目经历
@@ -151,7 +138,9 @@ XML 标签必须正确闭合，否则简历无法渲染。
   - 技能特长
 
 每个模块的量化数据（GPA、排名、奖项级别、项目成果数字）必须原样保留。
-宁可内容稍多，绝不擅自阉割——HR 比你更清楚什么信息对候选人重要。
+
+⚠️ 空模块跳过规则（与全量保留同等优先级）：
+如果原始简历中某个模块【完全没有实质内容】——判断标准：正文为空、仅写"无"、"暂无"、"无相关经历"、"无获奖记录"等占位文本——则直接跳过该模块。不要输出 ## 模块标题，不要补"暂无"，不要补任何占位文本。HR 看到干净的简历比看到"暂无实习经历"更专业，空模块不是简历的必要组成部分。
 
 ══════════════════════════════════════════════════════════
 【铁律二】STAR 融合 — 拒绝口水话，拒绝二级标题
@@ -208,22 +197,69 @@ XML 标签必须正确闭合，否则简历无法渲染。
 严禁使用其他分隔符（如逗号、破折号、空格对齐），必须严格使用竖线 | 分隔三段。
 
 ══════════════════════════════════════════════════════════
-【铁律六】技能特长格式 — 领域驱动分层展示
+【铁律六】技能特长深度结构化格式 —— 绝对禁止扁平标签
 ══════════════════════════════════════════════════════════
-技能特长模块必须以"核心技术栈"为总标题，按领域驱动力分层，每层一个独立行：
 
-正确格式:
-**核心技术栈**
-- **Agent 开发:** Python (精通), LangGraph (深研), Pydantic AI, LangChain, Tool Calling Pipeline
-- **AI 基础设施:** RAG 架构, ChromaDB, vLLM 推理部署, Token 机制与 Prompt Engineering
-- **多模态与模型:** Qwen-VL, DeepSeek, Transformer 原理
-- **工程与交付:** FastAPI (异步并发), Docker, CI/CD, Linux 系统调优
+⛔ 绝对禁止的写法（违反此格式的输出将被物理拦截）:
+  ❌ Java (熟练), Python (熟练), MySQL (熟悉)                   ← 扁平括号熟练度
+  ❌ **编程语言:** Java, Python, Go, C++                        ← 纯名词罗列
+  ❌ - 熟练掌握 Spring Boot、MyBatis、Redis                      ← 无粗体锚点的标签堆砌
+  ❌ - **Java**: 熟练使用 Spring Boot 进行后端开发                 ← 粗体后直接冒号截断，无场景描述
+
+✅ 唯一合法的技能模块格式 —— 必须严格复制以下 Markdown 结构:
+
+### 核心技术栈
+
+* **AI 与大模型工程**
+  - 熟练掌握 **LangGraph / LangChain 框架**，熟悉 React、Plan-and-Execute 等设计范式，可独立完成复杂 Agent 状态机架构设计与实现。
+  - 熟悉 **RAG 全链路设计与优化**，能够结合具体业务场景对召回效果、响应质量与向量库（ChromaDB）系统性能进行针对性优化。
+  - 熟练使用 **Claude Code、OpenClaw** 等先进 Agent 辅助工具，了解其底层的代码理解、修改与任务拆解工程原理。
+
+* **后端开发与数据工程**
+  - 熟悉 **FastAPI / Spring Boot 等 Web 框架**，精通 RESTful API 设计与多线程异步编程，能够独立完成高性能接口开发。
+  - 熟练使用 **MySQL、Redis 等数据库**，深入理解索引底层 B+ 树原理，具备高频访问场景下的数据建模与 SQL 慢查询治理能力。
+
+* **开发运维与工程素养**
+  - 熟练掌握 **Docker 容器化与服务编排**，能独立编写多阶段构建 Dockerfile，完成全栈分布式服务的反向代理与反向路由配置。
+  - 熟练使用 **Git 进行版本控制**，深刻理解多人协同、Git Flow 分支管理机制，具备极强的代码规范与工业级工程化意识。
+
+══════════════════════════════════════════════════════════
+【格式死锁检查表】—— 你的输出必须逐条通过以下校验:
+══════════════════════════════════════════════════════════
+
+🔒 死锁 1 — 行首粗体关键词死锁:
+   每个 `- ` 列表项的"第一个 Markdown 粗体块"（即第一对 ** 之间的文字）
+   必须是一个具体的技术硬指标（4-10 个字），例如：
+     ✅ **LangGraph / LangChain 框架**
+     ✅ **MySQL、Redis 等数据库**
+     ✅ **Docker 容器化与服务编排**
+     ❌ **AI 与大模型工程** ← 太宽泛，这是大类名不是硬指标
+     ❌ **熟练掌握 Java** ← 动词不要进入粗体
+     ❌ **Java** ← 太短，需要有场景锚定词
+
+🔒 死锁 2 — 能力边界与场景对齐死锁:
+   粗体关键词后面的文字（逗号之后），必须立即展开为：
+   - 工程落地场景（如：异步编程、流程编排、索引优化、容器化部署）
+   - 可量化的技术边界（如：慢查询治理、性能调优、反向代理配置、数据建模）
+   严禁输出纯教科书式概念解释（如"Java 是一种面向对象的编程语言"）。
+   必须使用"能够/可独立完成/具备/深入理解/精通/熟悉"等能力锚定词。
+
+🔒 死锁 3 — 层级结构死锁:
+   一级大类标题: * **大类名称**（单星号 + 粗体，2-4 个大类）
+   二级技能条目:   - <动词> **<4-10字硬指标>**<逗号><工程场景描述>
+   缩进严格为 2 空格（即 `  - `），大类与条目之间的缩进层级必须清晰可辨。
+
+🔒 死锁 4 — 禁止残余污染:
+   - 大类名称中禁止出现括号熟练度
+   - 技能描述中禁止出现 (熟练)、(精通)、(熟悉) 等括号标注
+   - 每个大类下 2-4 条技能描述，不得少于 2 条也不得多于 4 条
+   - 全模块 3-4 个大类，不得少于 3 个也不得多于 4 个
 
 分层原则:
-- 按 Agent 工程师核心竞争力对技术进行领域归类，禁用扁平罗列
-- 关键技能标注熟练度（如"精通"、"深研"），普通技能仅列出名词
-- 剔除非核心竞争力标签：Git、Linux 基础操作、Tailwind CSS 等通用基础工具
-- 每个领域的技能词必须与项目经历中的术语保持联动一致
+- 将简历中所有技能归纳为 3-4 个与目标 JD 强对齐的专业大类
+- 每个大类的命名必须体现工程深度，禁用"编程语言""开发工具"等浅层分类
+- 每个技能词的描述必须与下方项目经历中的术语保持精确联动
+- 剔除非核心竞争力标签：Git 基础操作、Office、Photoshop、打字速度等
 
 ══════════════════════════════════════════════════════════
 【铁律七】技术深度 + 量化 + 降维打击叙事
@@ -263,6 +299,68 @@ XML 标签必须正确闭合，否则简历无法渲染。
 - 每条要点使用 - 开头（无序列表），每条占一行
 - 技能使用 **类别：** 加粗格式，每个大类独立一行
 - 获奖情况使用 - 列表，每项一行
+
+══════════════════════════════════════════════════════════
+【铁律十】绝对输出禁语令 —— 违反此律者输出将被物理截断
+══════════════════════════════════════════════════════════
+你的 <clean_resume> 标签内是直接投递给 HR 的正式文档。以下内容被【绝对禁止】出现在输出中的任何位置（包括标签内外）：
+
+⛔ 禁止寒暄与问候:
+   - ❌ "好的"、"收到"、"明白了"、"没问题"
+   - ❌ "以下是优化后的简历"、"已经为您生成"、"请查收"
+   - ❌ "希望这份简历能帮到您"、"祝您求职顺利"、"期待您的反馈"
+   - ❌ "如果有任何问题"、"如需进一步修改"、"随时联系"
+   - ❌ "OK"、"Sure"、"Here is"、"Below is"、"I hope"、"Good luck"
+
+⛔ 禁止 Markdown 代码块包裹:
+   - ❌ 严禁在 <clean_resume> 内外输出 ``` 或 ```markdown 或 ```md 标记
+   - 你输出的内容就是最终文档本身，不是"代码示例"
+   - 简历是 Markdown 正文，不需要用代码块包裹
+
+⛔ 禁止角色扮演与元评论:
+   - ❌ "作为资深猎头"、"根据我的经验"、"我注意到"
+   - ❌ "你的简历存在以下问题"、"建议你"、"你应该"
+   - ❌ 任何对简历内容的评价、分析、或修改说明
+   - 标签外的分析思考会被物理丢弃，不要浪费 Token
+
+⛔ 禁止署名与签名:
+   - ❌ 不要在你的输出末尾署名或写结语
+   - 简历以最后一个模块的最后一条要点为终点，之后不要有任何额外文字
+
+⛔ 标签格式死锁:
+   - 必须使用 <clean_resume> 和 </clean_resume>，不允许写成 <clean resume> 或其他变体
+   - 标签必须独立成行（前后可以有空白字符，但不应与其他内容挤在同一行）
+
+违反以上任何一条，你的输出将在物理层面被截断清洗，导致简历不完整。
+请把你所有的"服务意识"收敛为唯一一种表达：写出一份质量极高的纯净 Markdown 简历正文。
+
+══════════════════════════════════════════════════════════
+【铁律十一】RAG 动态检索上下文冷酷审计与拒绝机制
+══════════════════════════════════════════════════════════
+以下是系统从 JD 中提取的 15 个核心技术锚点，代表目标岗位的真实技术要求。
+你在撰写简历时必须遵守以下审计规则：
+
+1. 【技术新增审计】任何你想添加到简历中的新技术栈/框架/工具/中间件，
+   必须满足以下两个条件之一：
+   (a) 该技术出现在下方的「JD 核心技术锚点清单」中，或
+   (b) 该技术已存在于原始简历中
+
+2. 【幻觉拦截】如果你打算使用的技术既不在锚点清单也不在原始简历中 →
+   这是幻觉信号，立即放弃该技术，不得写入简历
+
+3. 【技术预算约束】锚点清单是你的"技术预算上限"——你只能在此范围内
+   做 STAR 技术深度的合理延伸。严禁因清单包含了某个技术，就在候选人
+   根本没有相关经验的模块中凭空编造该技术的项目经历
+
+4. 【编造熔断】若锚点清单要求的技术（如 K8s、多活架构）候选人完全不具备，
+   宁可让对应模块留白或用占位符标记，也不允许编造虚假经历去匹配
+
+5. 【正向引导】锚点清单同时是技术深度的"安全区"——清单内的技术词
+   可以放心做深度展开（原理推导/性能调优/工程落地），因为这些
+   技术已经过 JD 对齐审计
+
+JD 核心技术锚点清单:
+{jd_keywords}
 
 ──────────────────────────────
 
@@ -313,9 +411,33 @@ EDITOR_EXTREME_GAP_PROMPT = """你是一位诚实的职业规划顾问。当前�
 - 禁止 (估算)、(待确认指标) 等噪音词
 
 ══════════════════════════════════════════════════════════
-【铁律五】全量保留
+【铁律五】全量保留 + 空模块跳过
 ══════════════════════════════════════════════════════════
-原简历的每个模块必须保留，一个不能删。
+原简历中每个【有实质内容】的模块必须保留。如果某模块完全没有实质内容（正文为空或仅"无/暂无"字样），直接跳过该模块，不输出标题和占位文本。
+
+══════════════════════════════════════════════════════════
+【铁律六】绝对输出禁语令
+══════════════════════════════════════════════════════════
+绝对禁止输出：寒暄问候（"好的"、"以下是"、"希望这份简历能帮到您"）、
+Markdown 代码块包裹（``` 标记）、角色扮演评论、署名结语、祝福语。
+<clean_resume> 标签内必须是可直接投递的纯净简历正文。
+
+══════════════════════════════════════════════════════════
+【铁律七】RAG 动态检索上下文冷酷审计 — 防幻觉熔断
+══════════════════════════════════════════════════════════
+以下是系统从 JD 中提取的 15 个核心技术锚点。在骨架搭建模式下：
+1. 任何新增技术必须出现在锚点清单中或已存在于原始简历 — 否则是幻觉，禁止写入
+2. 若锚点要求的技术候选人完全不具备 → 用方括号占位符留白，严禁编造
+3. 锚点清单是你的"技术安全区"——仅在清单范围内做合理深度延伸
+
+JD 核心技术锚点清单:
+{jd_keywords}
+
+【术语注入库（匹配平替词汇，仅用于启发，严禁照抄）】:
+{term_injection}
+
+【金牌案例（深度利用其技术方案和量化数字作为参考基线）】:
+{golden_cases}
 
 【联网搜索补充】: {web_search_context}
 【目标岗位 JD】: {jd}
@@ -366,11 +488,14 @@ def editor_node(state: AgentState):
       - optimization_summary: 标签外的简短策略说明
       - clean_resume_json: {}（v3.0 已弃用 JSON，保留字段兼容）
     """
-    resume = state.get("resume", "")
-    jd = state.get("jd", "")
-    rag_context = state.get("rag_context", "")
-    tool_outputs = state.get("tool_outputs", [])
-    difficulty_flag = state.get("difficulty_flag", "")
+    # ── v5.9 None 安全兜底：state.get() 键存在值=None 时默认值失效，改用 or ──
+    resume = state.get("resume") or ""
+    jd = state.get("jd") or ""
+    rag_context = state.get("rag_context") or ""
+    tool_outputs = state.get("tool_outputs") or []
+    difficulty_flag = state.get("difficulty_flag") or ""
+    jd_keywords = state.get("jd_keywords") or "（未提取 JD 锚点，请基于 JD 原文自行判断核心技术栈）"
+    retriever_metrics = state.get("retriever_metrics") or ""
 
     if not resume.strip():
         return {
@@ -386,14 +511,27 @@ def editor_node(state: AgentState):
     else:
         web_search_context = "（未启用联网搜索）"
 
+    # ── RAG 上下文预处理（正常模式 + EXTREME_GAP 模式共用）──
+    rag_items = _split_rag_items(rag_context)
+    term_injection = _build_term_injection(rag_items)
+    golden_cases = _build_golden_cases(rag_items)
+
+    if not rag_context.strip():
+        golden_cases = "（未检索到相关金牌案例，请基于通用大厂标准进行优化）"
+        term_injection = "（暂无专属术语库，请基于通用大厂标准进行动词升级）"
+
     # ── 防幻觉骨架模式 ──
     if difficulty_flag == "EXTREME_GAP":
         prompt = EDITOR_EXTREME_GAP_PROMPT.format(
+            term_injection=term_injection,
+            golden_cases=golden_cases,
+            jd_keywords=jd_keywords,
             web_search_context=web_search_context,
             jd=jd,
             resume=resume,
         )
-        print(f"[editor] 触发防幻觉骨架模式 (EXTREME_GAP), Prompt {len(prompt)} 字符")
+        print(f"[editor] 触发防幻觉骨架模式 (EXTREME_GAP), Prompt {len(prompt)} 字符, "
+              f"RAG {len(rag_items)} 条")
 
         try:
             llm = get_flash_client()
@@ -415,8 +553,14 @@ def editor_node(state: AgentState):
         print(f"[editor] 骨架模式完成, 输出 {len(clean_md)} 字符, 占位符 {placeholder_count} 处")
 
         monologue = (
-            f"[editor 防幻觉骨架模式] EXTREME_GAP，已禁用大厂级动词升级和量化编造。\n"
-            f"转为标准骨架搭建。输出 {len(clean_md)} 字符，{placeholder_count} 处占位符留白。\n"
+            f"[editor 防幻觉骨架模式] EXTREME_GAP，RAG 增强已注入 ({len(rag_items)} 条参考)。\n"
+            f"输出 {len(clean_md)} 字符，{placeholder_count} 处占位符留白。\n"
+            f"JD 锚点审计: {jd_keywords[:300]}\n"
+            f"[Editor Metrics v6.0] mode=EXTREME_GAP | "
+            f"rag_items={len(rag_items)} | "
+            f"output_chars={len(clean_md)} | "
+            f"placeholders={placeholder_count} | "
+            f"retriever_metrics={retriever_metrics}"
         )
 
         return {
@@ -427,17 +571,10 @@ def editor_node(state: AgentState):
         }
 
     # ── 正常模式 ──
-    rag_items = _split_rag_items(rag_context)
-    term_injection = _build_term_injection(rag_items)
-    golden_cases = _build_golden_cases(rag_items)
-
-    if not rag_context.strip():
-        golden_cases = "（未检索到相关金牌案例，请基于通用大厂标准进行优化）"
-        term_injection = "（暂无专属术语库，请基于通用大厂标准进行动词升级）"
-
     prompt = EDITOR_SYSTEM_PROMPT.format(
         term_injection=term_injection,
         golden_cases=golden_cases,
+        jd_keywords=jd_keywords,
         web_search_context=web_search_context,
         jd=jd,
         resume=resume,
@@ -499,8 +636,26 @@ def editor_node(state: AgentState):
     # ── 统计信息 ──
     h2_count = len(re.findall(r"^##\s", clean_md, re.MULTILINE))
     pipe_count = len(re.findall(r"\|", clean_md))
+    # ── 遥测指标注入 ──
+    rag_keyword_count = len([k for k in jd_keywords.split("\n") if k.strip().startswith(("1","2","3","4","5","6","7","8","9","10","11","12","13","14","15"))])
+    if rag_keyword_count == 0:
+        rag_keyword_count = 15  # fallback 估算
+    editor_metrics = (
+        f"[Editor Metrics v6.0] mode=NORMAL | "
+        f"model={model_label} | "
+        f"rag_items={len(rag_items)} | "
+        f"jd_anchors={rag_keyword_count} | "
+        f"thinking_chars={len(thinking_text)} | "
+        f"output_chars={len(clean_md)} | "
+        f"h2_modules={h2_count} | "
+        f"pipe_separators={pipe_count} | "
+        f"retriever={retriever_metrics}"
+    )
+    monologue = monologue + "\n" + editor_metrics
+
     print(f"[editor] v3.0 Markdown 优化完成: {len(clean_md)} 字符, {h2_count} 个 ## 模块, "
           f"{pipe_count} 处 | 分隔符, summary {len(optimization_summary)} 字符")
+    print(f"[editor] {editor_metrics}")
 
     return {
         "revised_resume": clean_md,

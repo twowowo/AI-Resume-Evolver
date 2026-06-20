@@ -22,6 +22,8 @@ POLISHER_SYSTEM_PROMPT = """你是一位年薪 200 万的顶级简历精修师�
 3. 每个修改必须有明确的目的 —— 解决一个具体被扣分的问题
 4. 修改后必须让评审团下次打分时找不到同样的问题
 5. 【结构铁律】在根据裁判意见补充技术细节时，必须严格保持原有简历整体 STAR 结构的紧凑性与段落逻辑。严禁无限制灌水和盲目堆砌字数——每增加一段文字必须有清晰的"解决哪个扣分点"的对应关系。保持已有技术优势与核心骨架不变，只做靶向修补。
+6. 【空模块跳过规则】如果原简历中某个模块完全没有实质内容（正文为空、"无"、"暂无"等占位字样），直接跳过该模块，不输出 ## 模块标题，不补任何占位文本。
+7. 【绝对输出禁语令】直接输出修改后的完整简历正文，绝对禁止附带任何寒暄（"好的"、"以下是"）、Markdown 代码块包裹（```）、祝福语、署名结语、或角色扮演评论。
 
 【评审团的反馈 —— 这是你必须修复的问题清单】：
 {evaluation_feedback}
@@ -78,17 +80,20 @@ POLISHER_CRITICAL_PROMPT = """你是一位诚实的职业规划顾问。当前�
 【评分反馈 —— 了解为什么评分低】：
 {evaluation_feedback}
 
+【绝对输出禁语令】直接输出完整简历正文，绝对禁止任何寒暄、代码块包裹、祝福语或角色扮演评论。
+
 请直接输出骨架优化后的完整简历（包含占位符，这是唯一一次全力一击，不允许失败）："""
 
 
 def polisher_node(state: AgentState):
     """精修/硬核重组节点：根据 difficulty_flag 切换行为模式"""
-    revised_resume = state.get("revised_resume", "")
-    jd = state.get("jd", "")
-    original_resume = state.get("resume", "")
-    feedback = state.get("evaluation_feedback", "")
-    iteration_count = state.get("iteration_count", 0)
-    difficulty_flag = state.get("difficulty_flag", "")
+    # ── v5.9 None 安全兜底 ──
+    revised_resume = state.get("revised_resume") or ""
+    jd = state.get("jd") or ""
+    original_resume = state.get("resume") or ""
+    feedback = state.get("evaluation_feedback") or ""
+    iteration_count = state.get("iteration_count") or 0
+    difficulty_flag = state.get("difficulty_flag") or ""
 
     if not revised_resume.strip():
         return {
@@ -130,7 +135,8 @@ def polisher_node(state: AgentState):
         llm = get_pro_client()
         response = llm.invoke(prompt)
         content = response.content if hasattr(response, "content") else str(response)
-        polished = content.strip()
+        from src.utils.text_sanitizer import sanitize_resume_text
+        polished = sanitize_resume_text(content.strip(), log_prefix="[polisher]")
 
         # 提取 thinking（如果有）
         thinking = ""

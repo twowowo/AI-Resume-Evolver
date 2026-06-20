@@ -20,6 +20,7 @@ import logging
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain_core.tools import ToolException
+from langchain_core.runnables import RunnableConfig
 from tavily import TavilyClient
 from sqlalchemy import select
 
@@ -32,8 +33,14 @@ logger = logging.getLogger("AgentTools")
 
 _VALID_SECTIONS = ["basic", "skills", "projects", "campus"]
 
-# 固定全局 mock 用户 ID（后续 4.0 端点中会从系统 Session 动态获取）
-MOCK_USER_ID = "zhou_jiankai_001"
+
+def _extract_user_id(config: RunnableConfig | None = None) -> str:
+    """从 LangGraph RunnableConfig 中提取 JWT 身份标识"""
+    if config and isinstance(config, dict):
+        user_id = config.get("configurable", {}).get("user_id", "")
+        if user_id:
+            return user_id
+    return "unknown"
 
 
 # ==========================================
@@ -122,13 +129,15 @@ class PatchResumeInput(BaseModel):
 
 
 @tool(args_schema=PatchResumeInput)
-def patch_resume_tool(section: str, new_content: str, evidence: str = "", jd_requirement: str = "") -> str:
+def patch_resume_tool(section: str, new_content: str, evidence: str = "", jd_requirement: str = "", config: RunnableConfig = None) -> str:
     """
     当用户明确发出指令，要求修改、润色、或补充简历的某个特定部分时调用。
     严禁重写整份简历！只对目标 section 实施微创手术替换。
 
     v4.6 Ragas 证据链锚定: 每次调用必须附带 evidence 参数，说明 JD 依据与简历修改的对应关系。
     """
+    user_id = _extract_user_id(config)
+
     if section not in _VALID_SECTIONS:
         raise ToolException(
             f"【硬拦截】非法章节 [{section}]，合法范围必须在 {_VALID_SECTIONS} 内。"
@@ -149,18 +158,18 @@ def patch_resume_tool(section: str, new_content: str, evidence: str = "", jd_req
 
     try:
         with SessionLocal() as session:
-            stmt = select(UserResume).where(UserResume.user_id == MOCK_USER_ID)
+            stmt = select(UserResume).where(UserResume.user_id == user_id)
             resume = session.scalars(stmt).first()
 
             if not resume:
-                resume = UserResume(user_id=MOCK_USER_ID)
+                resume = UserResume(user_id=user_id)
                 session.add(resume)
 
             setattr(resume, section, new_content)
             session.commit()
 
             logger.info(
-                f"[MySQL_UPDATE_SUCCESS] 用户 [{MOCK_USER_ID}] "
+                f"[MySQL_UPDATE_SUCCESS] 用户 [{user_id}] "
                 f"的 [{section}] 章节物理落盘成功！"
             )
 
@@ -216,16 +225,17 @@ class SaveProfileInput(BaseModel):
 
 
 @tool(args_schema=SaveProfileInput)
-def save_user_profile_tool(key: str, value: str) -> str:
+def save_user_profile_tool(key: str, value: str, config: RunnableConfig = None) -> str:
     """
     在多轮拉锯聊天中，当大模型敏锐地捕捉到用户的核心求职倾向、心仪大厂、
     或者个人不经意间吐露出的关键高光技术栈时，
     主动调用此工具将核心画像特征冰冻沉淀。
     """
+    user_id = _extract_user_id(config)
     try:
         with SessionLocal() as session:
             stmt = select(UserProfile).where(
-                UserProfile.user_id == MOCK_USER_ID,
+                UserProfile.user_id == user_id,
                 UserProfile.profile_key == key,
             )
             profile = session.scalars(stmt).first()
@@ -234,14 +244,14 @@ def save_user_profile_tool(key: str, value: str) -> str:
                 profile.profile_value = value
             else:
                 profile = UserProfile(
-                    user_id=MOCK_USER_ID, profile_key=key, profile_value=value
+                    user_id=user_id, profile_key=key, profile_value=value
                 )
                 session.add(profile)
 
             session.commit()
             logger.info(
-                f"[MySQL_UPSERT_SUCCESS] 画像特征 [{key} -> {value}] "
-                f"成功并网用户长期记忆库！"
+                f"[MySQL_UPSERT_SUCCESS] 用户 [{user_id}] "
+                f"画像特征 [{key} -> {value}] 成功并网长期记忆库！"
             )
             return (
                 f"【系统通知】: 用户画像 [{key} -> {value}] 已更新，状态：同步就位。"
@@ -320,28 +330,32 @@ def calculate_precise_metrics(expression: str) -> str:
 calculate_precise_metrics.handle_tool_error = True
 
 
-def get_user_profile() -> dict[str, str]:
+def get_user_profile(user_id: str = "") -> dict[str, str]:
     """获取当前用户的物理记忆字典，用于控制台及调试审计。"""
+    if not user_id:
+        return {}
     try:
         with SessionLocal() as session:
-            stmt = select(UserProfile).where(UserProfile.user_id == MOCK_USER_ID)
+            stmt = select(UserProfile).where(UserProfile.user_id == user_id)
             profiles = session.scalars(stmt).all()
             return {p.profile_key: p.profile_value for p in profiles}
     except Exception:
         return {}
 
 
-def clear_user_profile() -> None:
+def clear_user_profile(user_id: str = "") -> None:
     """一键清空该用户的物理画像长期记忆。"""
+    if not user_id:
+        return
     try:
         with SessionLocal() as session:
-            stmt = select(UserProfile).where(UserProfile.user_id == MOCK_USER_ID)
+            stmt = select(UserProfile).where(UserProfile.user_id == user_id)
             profiles = session.scalars(stmt).all()
             for p in profiles:
                 session.delete(p)
             session.commit()
             logger.info(
-                f"[MySQL_DELETE_SUCCESS] 用户 [{MOCK_USER_ID}] "
+                f"[MySQL_DELETE_SUCCESS] 用户 [{user_id}] "
                 f"的物理长期记忆库执行了彻底擦除"
             )
     except Exception as e:

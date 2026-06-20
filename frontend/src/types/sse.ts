@@ -14,7 +14,9 @@ export type AgentEvent =
   | "START"
   | "NODE_CHANGED"
   | "END"
-  | "ERROR";
+  | "ERROR"
+  | "ABORTED"
+  | "RESIDUAL";
 
 // ── 诊断原文 ──
 export interface DiagnosisData {
@@ -73,6 +75,8 @@ export interface FinalFrame {
   is_extreme_gap: boolean;
   iteration_count: number;
   score_improvement: number;
+  display_score_change: boolean;
+  circuit_breaker_triggered: boolean;
   internal_monologue: string;
   evaluation_feedback: string;
   pre_eval_dimensions: Record<string, number>;
@@ -108,6 +112,8 @@ export interface PipelineStreamState {
   questions: StressTestQuestion[];
   monologue: string;
   scoreImprovement: number;
+  displayScoreChange: boolean;
+  circuitBreakerTriggered: boolean;
   sessionId: string;
   error: string | null;
   visualPayload: VisualPayload | null;

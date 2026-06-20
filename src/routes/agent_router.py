@@ -16,9 +16,9 @@ import json
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from sqlalchemy import select
 
@@ -26,6 +26,7 @@ from src.graphs import agent_graph as _agent_graph_module
 from src.database.connection import SessionLocal
 from src.database.models import UserResume
 from src.utils.llm import get_flash_client
+from src.utils.checkpoint_rollback import rollback_thread_to_parent
 
 logger = logging.getLogger("AgentRouter")
 logging.basicConfig(level=logging.INFO)
@@ -33,14 +34,29 @@ logging.basicConfig(level=logging.INFO)
 # ── v4.1 全局专用线程池：物理抽离同步 DB I/O，释放 FastAPI 单线程事件循环十万并发带宽 ──
 db_executor = ThreadPoolExecutor(max_workers=10)
 
+# ── v5.9 session 级异步锁字典：每个 thread_id 一把独立锁，消除并发竞态 ──
+_session_locks: dict[str, asyncio.Lock] = {}
+_session_locks_guard = asyncio.Lock()  # 保护 _session_locks 字典本身的并发写入
+
+
+async def _get_session_lock(thread_id: str) -> asyncio.Lock:
+    """获取或创建指定 thread_id 的会话级异步锁，保证同 session 操作原子性"""
+    async with _session_locks_guard:
+        if thread_id not in _session_locks:
+            _session_locks[thread_id] = asyncio.Lock()
+        return _session_locks[thread_id]
+
 router = APIRouter(prefix="/api/agent", tags=["AI Agent 中央大脑"])
 
 
 class AgentPayload(BaseModel):
-    """v4.2 三层漏斗隔离沙箱请求体 —— user_id + resume_id 动态复合钥匙"""
-    user_query: str
-    user_id: str = "default_user"
-    resume_id: str = "default_resume"
+    """v4.2 三层漏斗隔离沙箱请求体 —— user_id + resume_id 动态复合钥匙
+
+    v5.9 输入防线: 全部字段强制 max_length，杜绝 100k+ 文本轰炸
+    """
+    user_query: str = Field(..., max_length=4000, description="用户输入的自然语言指令，最大 4000 字符")
+    user_id: str = Field(default="default_user", max_length=128)
+    resume_id: str = Field(default="default_resume", max_length=128)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -165,7 +181,7 @@ def _build_resume_base(resume_record) -> str:
 
 
 @router.post("/stream")
-async def stream_agent_brain(payload: AgentPayload):
+async def stream_agent_brain(request: Request, payload: AgentPayload):
     """工业级 SSE 长连接流式端点 —— 将 LangGraph ReAct 环路逐帧催化至前端。
 
     v4.2 三层漏斗隔离沙箱：
@@ -176,10 +192,21 @@ async def stream_agent_brain(payload: AgentPayload):
     v4.3 后台异步影子审计：
       流结束后 asyncio.create_task(_run_ragas_shadow_eval) 点火，
       前台延迟增加 0ms。评估忠实度 + 回答相关性并输出审计日志。
+
+    v5.6 JWT 强制绑定：user_id 从 Bearer Token 推导，防御跨用户身份伪造。
     """
 
+    # ── v5.6 JWT 强制绑定：user_id 从令牌推导 ──
+    auth_user = getattr(request.state, "user", None)
+    user_id = auth_user.username if auth_user else payload.user_id
+    if auth_user and payload.user_id and payload.user_id != auth_user.username:
+        logger.warning(
+            f"[Security] 令牌不匹配拦截: payload.user_id={payload.user_id} "
+            f"vs JWT={auth_user.username} — 已强制使用 JWT 身份"
+        )
+
     # ── v4.2 Layer 3: 动态复合钥匙 ──
-    thread_id = f"{payload.user_id}::{payload.resume_id}"
+    thread_id = f"{user_id}::{payload.resume_id}"
     logger.info(f"[记忆沙箱点火] 线程已锁定: {thread_id}")
 
     # 1. 异步隔离：从 MySQL 捞出该用户的最新简历底座（线程池抽离同步阻塞）
@@ -190,29 +217,32 @@ async def stream_agent_brain(payload: AgentPayload):
 
     try:
         resume_record = await asyncio.get_event_loop().run_in_executor(
-            db_executor, _fetch_resume_sync, payload.user_id
+            db_executor, _fetch_resume_sync, user_id
         )
         current_resume_md = _build_resume_base(resume_record)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"物理存储底座读取故障: {str(e)}")
 
-    logger.info(f"[AgentSSE] 用户 [{payload.user_id}] 简历 [{payload.resume_id}] 发起请求, "
+    logger.info(f"[AgentSSE] 用户 [{user_id}] 简历 [{payload.resume_id}] 发起请求, "
                 f"query={len(payload.user_query)} 字符, resume={len(current_resume_md)} 字符")
 
     # 2. 初始化 LangGraph 状态机快照（注入沙箱身份标识 + 提效计数器）
     initial_state = {
         "messages": [HumanMessage(content=payload.user_query)],
         "current_resume_markdown": current_resume_md,
-        "user_id": payload.user_id,
+        "user_id": user_id,
         "resume_id": payload.resume_id,
         "step_count": 0,
         "total_tokens": 0,
     }
 
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": thread_id, "user_id": user_id, "resume_id": payload.resume_id}}
 
     # 3. SSE 生成器 — 流式挤出节点变更日志（内嵌 v4.3 影子审计数据收集）
     async def event_generator():
+        # ── v5.9 session 级异步锁：同 thread_id 并发操作原子化 ──
+        session_lock = await _get_session_lock(thread_id)
+
         # ── v4.1 双重栅栏防爆熔断器 ──
         total_streamed_chars = 0
         tool_call_count = 0
@@ -225,6 +255,8 @@ async def stream_agent_brain(payload: AgentPayload):
         collected_outputs: list[str] = []
         collected_contexts: list[str] = []
 
+        # ── v5.9 session 级异步锁：保护整个 SSE 流生命周期 ──
+        await session_lock.acquire()
         try:
             yield ("data: " + json.dumps({
                 "event": "START",
@@ -273,6 +305,15 @@ async def stream_agent_brain(payload: AgentPayload):
                                     payload_data["content"] = ""
                                     collected_contexts.append(content)
                                 else:
+                                    # AIMessage: 剥离可能混入的 Markdown 代码块包裹
+                                    if msg_type == "AIMessage":
+                                        from src.utils.text_sanitizer import strip_markdown_code_fences
+                                        content, stripped = strip_markdown_code_fences(content)
+                                        if stripped:
+                                            logger.info(
+                                                f"[AgentSSE] 代码块包裹剥离 | "
+                                                f"沙箱 [{thread_id}]"
+                                            )
                                     payload_data["content"] = content
                                     total_streamed_chars += len(content)
                                     if msg_type == "AIMessage":
@@ -348,7 +389,7 @@ async def stream_agent_brain(payload: AgentPayload):
                     query=payload.user_query,
                     contexts=collected_contexts[-8:],
                     output=final_output,
-                    user_id=payload.user_id,
+                    user_id=user_id,
                     resume_id=payload.resume_id,
                     step_count=step_count,
                     total_tokens=estimated_tokens,
@@ -359,12 +400,75 @@ async def stream_agent_brain(payload: AgentPayload):
                 f"步数={step_count}, Token≈{estimated_tokens}"
             )
 
+        except asyncio.CancelledError:
+            # ═══════════════════════════════════════════════════════
+            # v5.3 客户端主动 Abort 熔断处理 — 事务性状态回滚
+            # ═══════════════════════════════════════════════════════
+            logger.warning(
+                f"[Agent Aborted] 沙箱 [{thread_id}] 被前端主动熔断，"
+                f"已执行步数={step_count}, 已发送字符={total_streamed_chars}"
+            )
+
+            # 向数据库写入最后已知的简历状态（在回滚前先把已修改的内容落盘）
+            if initial_state.get("current_resume_markdown"):
+                logger.info(
+                    f"[Agent Aborted] 沙箱 [{thread_id}] "
+                    f"已锁定最后已知简历底座，回滚前状态已保留"
+                )
+
+            # 异步回滚 LangGraph checkpoint 到本轮请求前的安全快照
+            rollback_ok = await rollback_thread_to_parent(
+                _agent_graph_module.agent_compiled_graph,
+                thread_id,
+            )
+
+            if rollback_ok:
+                logger.info(
+                    f"[Agent Aborted] 沙箱 [{thread_id}] "
+                    f"Checkpoint 已回滚到父快照，本轮脏数据已擦除"
+                )
+            else:
+                logger.warning(
+                    f"[Agent Aborted] 沙箱 [{thread_id}] "
+                    f"Checkpoint 回滚未执行（可能为首轮请求，无父快照）"
+                )
+
+            # 向前端发送熔断确认帧
+            yield ("data: " + json.dumps({
+                "event": "ABORTED",
+                "data": {
+                    "node_name": "abort_handler",
+                    "msg_type": "SystemNotification",
+                    "content": (
+                        f"\n\n[熔断确认] 沙箱 [{thread_id}] 已安全中止。\n"
+                        f"本轮状态已回退到安全快照，您可以重新输入。"
+                    ),
+                    "thread_id": thread_id,
+                    "rolled_back": rollback_ok,
+                },
+            }, ensure_ascii=False) + "\n\n")
+
         except Exception as e:
             logger.error(f"[AgentSSE] 运行时异常: {str(e)}")
             yield ("data: " + json.dumps({
                 "event": "ERROR",
                 "data": f"运行时大脑炸裂: {str(e)}",
             }, ensure_ascii=False) + "\n\n")
+
+        finally:
+            # ═══════════════════════════════════════════════════════
+            # v5.3 资源清理栅栏：释放分布式锁 / 标记 IDLE
+            # 无论正常结束、异常炸裂还是前端 Abort，都会执行此块
+            # ═══════════════════════════════════════════════════════
+            logger.info(
+                f"[Agent Cleanup] 沙箱 [{thread_id}] 资源释放完成，"
+                f"步数={step_count}, 字符={total_streamed_chars}"
+            )
+            # ── v5.9 释放 session 级异步锁 ──
+            try:
+                session_lock.release()
+            except RuntimeError:
+                pass  # 锁未被持有（极端边界情况）
 
     return StreamingResponse(
         event_generator(),

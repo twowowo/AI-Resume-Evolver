@@ -28,11 +28,16 @@ v3.0 更新:
 #npm run dev
 #taskkill /f /im python.exe
 #taskkill /f /im node.exe
+#docker compose up -d --build
+#docker compose down && docker compose up -d --build
+#http://127.0.0.1:8080/
+#docker compose logs -f backend
 import json
 import os
 import sys
 import uuid
 import asyncio
+import re
 import traceback
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -105,13 +110,15 @@ def _build_radar(dims: dict, declared_score: int) -> "RadarMetrics | None":
     """从维度分数字典构建 RadarMetrics，含分项一致性校验"""
     if not dims:
         return None
+    # ── v5.9 None 安全兜底：防止上游节点传入 None 值导致 TypeError ──
+    _safe_score = declared_score if declared_score is not None else 0
     dims_sum = dims.get("jd_match", 0) + dims.get("star_completion", 0) + dims.get("verb_quality", 0)
-    if declared_score > 0 and abs(declared_score - dims_sum) <= 3:
-        total = declared_score
+    if _safe_score > 0 and abs(_safe_score - dims_sum) <= 3:
+        total = _safe_score
     elif dims_sum > 0:
         total = dims_sum
     else:
-        total = declared_score
+        total = _safe_score
     return RadarMetrics.from_dimensions(dims, total)
 
 
@@ -153,6 +160,15 @@ async def lifespan(app: FastAPI):
     # ── v5.2 AsyncSqliteSaver 异步上下文管理器解包，生命周期 = 进程存活期 ──
     os.makedirs("data", exist_ok=True)
     async with AsyncSqliteSaver.from_conn_string("data/resume_state.db") as checkpointer:
+        # ── v5.9 WAL 模式 + 异步写入优化：彻底规避 database is locked ──
+        import aiosqlite
+        _wal_conn = await aiosqlite.connect("data/resume_state.db")
+        await _wal_conn.execute("PRAGMA journal_mode=WAL;")
+        await _wal_conn.execute("PRAGMA synchronous=NORMAL;")
+        await _wal_conn.execute("PRAGMA busy_timeout=5000;")
+        await _wal_conn.close()
+        print("[server] SQLite WAL 模式已激活 (journal_mode=WAL, synchronous=NORMAL, busy_timeout=5000ms)")
+
         _app_graph = build_graph(checkpointer=checkpointer)
         print("[server] AsyncSqliteSaver 异步状态机已挂载 → data/resume_state.db")
 
@@ -313,7 +329,8 @@ async def _stream_pipeline(initial_state: dict, thread_id: str = ""):
         # ── 里程碑 2: Editor 完成 → 推送精修简历文本 + 混合解耦载荷 ──
         if not yielded_resume and state.get("revised_resume"):
             yielded_resume = True
-            revised = state["revised_resume"]
+            from src.utils.text_sanitizer import sanitize_resume_text
+            revised = sanitize_resume_text(state["revised_resume"], log_prefix="[sse]")
             opt_summary = state.get("optimization_summary", "")
             clean_json = state.get("clean_resume_json", {})
             vp = compile_to_visual_payload(revised)
@@ -344,8 +361,31 @@ async def _stream_pipeline(initial_state: dict, thread_id: str = ""):
                      pre_eval_dims.get("verb_quality", 0))
 
         is_extreme_gap = final_state.get("difficulty_flag", "") == "EXTREME_GAP"
-        revised_final = final_state.get("revised_resume", "")
+        from src.utils.text_sanitizer import sanitize_resume_text
+        revised_final = sanitize_resume_text(final_state.get("revised_resume", ""), log_prefix="[sse-final]")
         vp_final = compile_to_visual_payload(revised_final) if revised_final else {}
+
+        # ── v5.4 极端情况熔断器：防止用户信任危机 ──
+        # v5.9 None 安全兜底：上游节点可能传入 None score
+        _safe_eval_score = eval_score if eval_score is not None else 0
+        _safe_pre_total = pre_total if pre_total is not None else 0
+        score_improvement = _safe_eval_score - _safe_pre_total if _safe_pre_total > 0 else 0
+        display_score_change = True
+        circuit_breaker_triggered = False
+
+        _CIRCUIT_BREAKER_MSG = (
+            "当前简历与目标 JD 存在明显的技术栈脱节，"
+            "系统已尽力优化表达，但核心硬实力差距较大，"
+            "建议针对性提升相关技术、多积累项目经验后再尝试对齐。"
+        )
+
+        if (score_improvement < 5) and _safe_eval_score < 50:
+            circuit_breaker_triggered = True
+            display_score_change = False
+            score_improvement = 0
+            print(f"[sse] ⚠️ 信任熔断触发 | 原始={_safe_pre_total} 优化后={_safe_eval_score} "
+                  f"delta={_safe_eval_score - _safe_pre_total if _safe_pre_total > 0 else 'N/A'} | "
+                  f"已抑制分数变化展示，重写评语为专业建议")
 
         yield _sse_event("final", {
             "optimized_resume_radar": {
@@ -359,21 +399,95 @@ async def _stream_pipeline(initial_state: dict, thread_id: str = ""):
             "difficulty_flag": final_state.get("difficulty_flag", ""),
             "is_extreme_gap": is_extreme_gap,
             "iteration_count": final_state.get("iteration_count", 0),
-            "score_improvement": eval_score - pre_total if pre_total > 0 else 0,
+            "score_improvement": score_improvement,
+            "display_score_change": display_score_change,
+            "circuit_breaker_triggered": circuit_breaker_triggered,
             "internal_monologue": final_state.get("internal_monologue", ""),
-            "evaluation_feedback": final_state.get("evaluation_feedback", ""),
+            "evaluation_feedback": (
+                _CIRCUIT_BREAKER_MSG if circuit_breaker_triggered
+                else final_state.get("evaluation_feedback", "")
+            ),
             "pre_eval_dimensions": pre_eval_dims,
             "eval_dimensions": eval_dims,
-            "optimization_summary": final_state.get("optimization_summary", ""),
+            "optimization_summary": (
+                _CIRCUIT_BREAKER_MSG if circuit_breaker_triggered
+                else final_state.get("optimization_summary", "")
+            ),
             "clean_resume_json": final_state.get("clean_resume_json", {}),
             "visual_payload": vp_final,
             "session_id": thread_id,
         })
         print(f"[sse] 分帧3 final: 终评 {eval_score}/100, 压测题 {len(questions)} 道, "
-              f"提升 +{eval_score - pre_total if pre_total > 0 else 'N/A'} 分")
+              f"提升 +{score_improvement} 分"
+              f"{' [信任熔断已激活]' if circuit_breaker_triggered else ''}")
 
     yield _sse_event("done", {})
     print(f"[sse] 流式推送完成 (4/4 帧已全部发送), thread_id={thread_id}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# v5.5 输入保护性熔断：极短/无效输入优雅降级
+# ═══════════════════════════════════════════════════════════════
+
+_INPUT_DEGRADED_MSG = (
+    "当前输入的简历或 JD 内容过于简略，技术栈严重脱节。"
+    "系统已启动保护性熔断，请补充具体的项目经历与核心技术栈后再尝试演进。"
+)
+
+_MIN_RESUME_CHARS = 10  # 去空格后最少字符数
+_MIN_JD_CHARS = 10
+
+
+async def _generate_degraded_sse(thread_id: str, reason: str) -> str:
+    """当输入文本过短时，跳过全链路直接返回保护性熔断 SSE 帧。
+
+    前端收到 circuit_breaker_triggered=true 后展示琥珀色提示卡。
+    """
+    yield _sse_event("radar_init", {
+        "original_resume_radar": {
+            "jd_matching_score": 0,
+            "star_perf_score": 0,
+            "action_verbs_score": 0,
+            "total_score": 0,
+        },
+        "diagnosis": {
+            "feedback": reason,
+            "core_tool_overlap": "输入保护性熔断",
+            "matched_skills": [],
+            "missing_skills": [],
+            "star_strengths": [],
+            "star_weaknesses": [],
+            "weak_verbs": [],
+        },
+    })
+
+    yield _sse_event("final", {
+        "optimized_resume_radar": {
+            "jd_matching_score": 0,
+            "star_perf_score": 0,
+            "action_verbs_score": 0,
+            "total_score": 0,
+        },
+        "optimized_resume_text": "",
+        "stress_test_questions": [],
+        "difficulty_flag": "DEGRADED",
+        "is_extreme_gap": False,
+        "iteration_count": 0,
+        "score_improvement": 0,
+        "display_score_change": False,
+        "circuit_breaker_triggered": True,
+        "internal_monologue": "",
+        "evaluation_feedback": reason,
+        "pre_eval_dimensions": {},
+        "eval_dimensions": {},
+        "optimization_summary": reason,
+        "clean_resume_json": {},
+        "visual_payload": None,
+        "session_id": thread_id,
+    })
+
+    yield _sse_event("done", {})
+    print(f"[sse] 输入保护性熔断完成, thread_id={thread_id}")
 
 
 # ── 核心路由：简历优化 ──
@@ -398,11 +512,36 @@ async def optimize_resume(request: Request, payload: ResumeOptimizeRequest):
     **INTERACTIVE 模式**: 已并网！前端应在拿到 session_id 后，通过 /api/v1/resume/chat 发起多轮补充。
     此端点返回的 final 帧中包含 session_id，前端需保存该 ID 用于后续 chat 调用。
     """
-    # ── v4.2 三层漏斗 Layer 1: 动态复合钥匙 f"{user_id}_{resume_id}" ──
-    user_id = payload.user_id
+    # ── v5.6 JWT 强制绑定：user_id 从令牌推导，防御跨用户身份伪造 ──
+    auth_user = getattr(request.state, "user", None)
+    user_id = auth_user.username if auth_user else payload.user_id
+    if auth_user and payload.user_id and payload.user_id != auth_user.username:
+        print(f"[Security] ⚠️ 令牌不匹配拦截: payload.user_id={payload.user_id} "
+              f"vs JWT={auth_user.username} — 已强制使用 JWT 身份")
     resume_id = payload.resume_id
     thread_id = f"{user_id}::{resume_id}"
     print(f"[记忆沙箱点火] 线程已锁定: {thread_id}")
+
+    # ── v5.5 输入保护性熔断：极短/无效输入优雅降级，杜绝 422 ──
+    stripped_resume = payload.resume_text.strip()
+    stripped_jd = payload.jd_text.strip()
+    if len(stripped_resume) < _MIN_RESUME_CHARS or len(stripped_jd) < _MIN_JD_CHARS:
+        short_parts = []
+        if len(stripped_resume) < _MIN_RESUME_CHARS:
+            short_parts.append(f"简历仅 {len(stripped_resume)} 字符（阈值 {_MIN_RESUME_CHARS}）")
+        if len(stripped_jd) < _MIN_JD_CHARS:
+            short_parts.append(f"JD 仅 {len(stripped_jd)} 字符（阈值 {_MIN_JD_CHARS}）")
+        print(f"[api] ⚠️ 输入保护性熔断触发 | {', '.join(short_parts)} | thread_id={thread_id}")
+
+        return StreamingResponse(
+            _generate_degraded_sse(thread_id, _INPUT_DEGRADED_MSG),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     print(f"\n[api] 收到优化请求 [{payload.mode.value}]: 简历 {len(payload.resume_text)} 字符, "
           f"JD {len(payload.jd_text)} 字符, thread_id={thread_id}")
@@ -517,7 +656,8 @@ async def _stream_chat_pipeline(thread_id: str, user_message: str):
             print(f"[chat_sse] status: {node_status[:80]}...")
 
         # ── 帧: 简历文本变更推送 (对齐前端 resume_stream case) ──
-        revised = state.get("revised_resume", "")
+        from src.utils.text_sanitizer import sanitize_resume_text
+        revised = sanitize_resume_text(state.get("revised_resume", ""), log_prefix="[chat_sse]")
         if revised and len(revised) != last_resume_len:
             last_resume_len = len(revised)
             vp = compile_to_visual_payload(revised)
@@ -541,7 +681,7 @@ async def _stream_chat_pipeline(thread_id: str, user_message: str):
             final_state.get("stress_test_questions", [])
         )
 
-        revised_final = final_state.get("revised_resume", "")
+        revised_final = sanitize_resume_text(final_state.get("revised_resume", ""), log_prefix="[chat_sse-final]")
         vp_final = compile_to_visual_payload(revised_final) if revised_final else {}
 
         yield _sse_event("final", {
@@ -588,6 +728,16 @@ async def chat_resume(request: Request, payload: ChatRequest):
     | `done` | 流正常结束 | 空 JSON `{}` |
     | `error` | 异常中断 | `error`: 异常信息 |
     """
+    # ── v5.6 JWT 强制绑定：校验 thread_id 前缀与令牌身份一致 ──
+    auth_user = getattr(request.state, "user", None)
+    if auth_user and "::" in (payload.thread_id or ""):
+        thread_owner = payload.thread_id.split("::")[0]
+        if thread_owner != auth_user.username:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"[安全熔断] 无权访问他人会话: thread 归属 {thread_owner}, JWT 身份 {auth_user.username}",
+            )
+
     print(f"\n[api] 收到交互补充请求: thread_id={payload.thread_id}, "
           f"message={len(payload.user_message)} 字符")
 
@@ -696,6 +846,109 @@ async def upload_and_parse(request: Request, file: UploadFile = File(...)):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"文件解析失败: {str(e)[:200]}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# v5.3 DOCX 导出：POST /api/resume/export/docx
+# ═══════════════════════════════════════════════════════════════
+from docx import Document
+from docx.shared import Pt, Inches
+
+@app.post("/api/resume/export/docx")
+async def export_resume_docx(request: Request):
+    """
+    将 Markdown 简历内容导出为 A4 规格 DOCX 文件。
+    仅对 **bold** 文本加粗，不添加任何边框/背景/色块。
+    """
+    body = await request.json()
+    markdown_content = body.get("markdown_content", "")
+
+    if not markdown_content or not markdown_content.strip():
+        raise HTTPException(status_code=400, detail="markdown_content 不能为空")
+
+    doc = Document()
+
+    # A4 标准边距：上下左右各 1 英寸
+    for section in doc.sections:
+        section.top_margin = Inches(1)
+        section.bottom_margin = Inches(1)
+        section.left_margin = Inches(1)
+        section.right_margin = Inches(1)
+
+    lines = markdown_content.split("\n")
+
+    for line in lines:
+        line = line.rstrip()
+        if not line:
+            continue
+
+        # ### 小标题 → 13pt Arial Bold
+        if line.startswith("### "):
+            text = line[4:].strip()
+            text = re.sub(r"\*\*", "", text)  # 清洗行内 ** 标记
+            p = doc.add_paragraph()
+            run = p.add_run(text)
+            run.font.size = Pt(13)
+            run.font.name = "Arial"
+            run.bold = True
+            continue
+
+        # ## 中标题 → 15pt Arial Bold
+        if line.startswith("## "):
+            text = line[3:].strip()
+            text = re.sub(r"\*\*", "", text)
+            p = doc.add_paragraph()
+            run = p.add_run(text)
+            run.font.size = Pt(15)
+            run.font.name = "Arial"
+            run.bold = True
+            continue
+
+        # # 大标题 → 18pt Arial Bold
+        if line.startswith("# "):
+            text = line[2:].strip()
+            text = re.sub(r"\*\*", "", text)
+            p = doc.add_paragraph()
+            run = p.add_run(text)
+            run.font.size = Pt(18)
+            run.font.name = "Arial"
+            run.bold = True
+            continue
+
+        # - 或 * 列表项
+        if re.match(r"^[\-\*]\s+", line):
+            list_text = re.sub(r"^[\-\*]\s+", "", line)
+            p = doc.add_paragraph(style="List Bullet")
+            _add_docx_inline_runs(p, list_text)
+            continue
+
+        # 普通段落
+        p = doc.add_paragraph()
+        _add_docx_inline_runs(p, line)
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": "attachment; filename=resume.docx"},
+    )
+
+
+def _add_docx_inline_runs(paragraph, text: str):
+    """
+    解析 **bold** 标记，仅加粗。
+    严禁添加方框、边框、背景底色、胶囊气泡或任何装饰。
+    """
+    parts = re.split(r"(\*\*.+?\*\*)", text)
+    for part in parts:
+        if part.startswith("**") and part.endswith("**"):
+            run = paragraph.add_run(part[2:-2])
+            run.bold = True
+        else:
+            paragraph.add_run(part)
 
 
 # ── v5.2 JWT 认证路由：POST /api/v1/auth/login ──

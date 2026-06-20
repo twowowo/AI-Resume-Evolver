@@ -40,6 +40,7 @@ services:
       - "8001:8001"
     volumes:
       - ./data:/app/data  # SqliteSaver 持久化 (resume_state.db) + 种子数据
+      - ./models/huggingface:/app/models/huggingface
     environment:
       # ── 服务端口 ──
       - PORT=8001
@@ -78,6 +79,8 @@ services:
       - JWT_SECRET=${JWT_SECRET:-zhoujiankai_jwt_secret_2026}
       - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
       - JWT_EXPIRE_MINUTES=${JWT_EXPIRE_MINUTES:-1440}
+
+      - HF_ENDPOINT=https://huggingface.co
 
     depends_on:
       chromadb:

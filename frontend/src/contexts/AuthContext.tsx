@@ -63,6 +63,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const logout = useCallback(() => {
+    localStorage.removeItem(AUTH_STORAGE_KEY);
+    localStorage.removeItem(AUTH_USER_KEY);
+    setToken(null);
+    setUser(null);
+    setError(null);
+  }, []);
+
+  // 监听全局 auth:expired 事件（streamRequest / vision.ts 在 401 时派发）
+  useEffect(() => {
+    const handleExpired = () => {
+      logout();
+      setError("登录已失效，请重新认证");
+    };
+    window.addEventListener("auth:expired", handleExpired);
+    return () => window.removeEventListener("auth:expired", handleExpired);
+  }, [logout]);
+
   const login = useCallback(async (username: string, password: string) => {
     setError(null);
     setIsLoading(true);
@@ -93,14 +111,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } finally {
       setIsLoading(false);
     }
-  }, []);
-
-  const logout = useCallback(() => {
-    localStorage.removeItem(AUTH_STORAGE_KEY);
-    localStorage.removeItem(AUTH_USER_KEY);
-    setToken(null);
-    setUser(null);
-    setError(null);
   }, []);
 
   return (

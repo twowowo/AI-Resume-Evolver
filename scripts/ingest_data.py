@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.utils.loader import load_docx, load_txt
-from src.utils.vector_store import add_terms
+from src.utils.vector_store import add_terms, reset_vector_store
 
 REFERENCE_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "reference")
 REFERENCE_DIR = os.path.abspath(REFERENCE_DIR)
@@ -67,7 +67,7 @@ def _clean_text(raw: str) -> tuple[list[str], list[dict]]:
 
             if len(content) >= MIN_TERM_LENGTH:
                 terms.append(content)
-                meta = {}
+                meta = {"source": "seed_data"}
                 if label:
                     meta["tag"] = label
                 meta["source_line"] = stripped[:80]
@@ -90,6 +90,9 @@ def _load_file(file_path: str) -> str:
 def run():
     with open(LOG_FILE, "w", encoding="utf-8") as f:
         f.write("")
+
+    # v7.0: 切换 Embedding 模型前强制重置 Collection，确保 1024d 维度对齐
+    reset_vector_store()
 
     txt_files = glob.glob(os.path.join(REFERENCE_DIR, "*.txt"))
     docx_files = glob.glob(os.path.join(REFERENCE_DIR, "*.docx"))

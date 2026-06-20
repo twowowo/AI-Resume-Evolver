@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { VisualPayload } from "@/types/sse";
+import { getToken, API_BASE } from "@/lib/api";
 
 interface Props {
   open: boolean;
@@ -15,74 +16,62 @@ interface Props {
 
 const mdComponents: Components = {
   h1: ({ children, ...props }) => (
-    <h1
-      className="text-xl font-bold mt-5 mb-3 border-b-2 border-gray-300 pb-1.5 tracking-wide"
-      {...props}
-    >
+    <h1 className="text-xl font-bold mt-6 mb-4 border-b-2 border-slate-300 pb-2 tracking-wide text-slate-900" {...props}>
       {children}
     </h1>
   ),
   h2: ({ children, ...props }) => (
-    <h2
-      className="text-lg font-bold mt-4 mb-2 border-b border-gray-200 pb-1 tracking-wide"
-      {...props}
-    >
+    <h2 className="text-[13pt] font-bold mt-5 mb-3 pb-1.5 border-b border-slate-300 text-slate-800 tracking-wide" {...props}>
       {children}
     </h2>
   ),
   h3: ({ children, ...props }) => (
-    <h3 className="text-base font-semibold mt-3 mb-1.5" {...props}>
+    <h3 className="text-[11pt] font-semibold mt-4 mb-2 pb-1 border-b border-slate-200 text-slate-700 tracking-normal" {...props}>
       {children}
     </h3>
   ),
   ul: ({ children, ...props }) => (
-    <ul className="list-disc pl-6 my-2 space-y-0.5" {...props}>
+    <ul className="a4-ul" {...props}>
       {children}
     </ul>
   ),
   ol: ({ children, ...props }) => (
-    <ol className="list-decimal pl-6 my-2 space-y-0.5" {...props}>
+    <ol className="a4-ol" {...props}>
       {children}
     </ol>
   ),
   li: ({ children, ...props }) => (
-    <li className="my-0.5 leading-relaxed" {...props}>
+    <li className="a4-li" {...props}>
       {children}
     </li>
   ),
   p: ({ children, ...props }) => (
-    <p className="my-1.5 leading-relaxed" {...props}>
+    <p className="my-1.5 leading-relaxed text-slate-700" {...props}>
       {children}
     </p>
   ),
   strong: ({ children, ...props }) => (
-    <strong className="font-bold text-gray-900" {...props}>
+    <strong className="font-bold text-slate-950 mr-1" {...props}>
       {children}
     </strong>
   ),
   table: ({ children, ...props }) => (
-    <table
-      className="w-full border-collapse border border-gray-300 my-3 text-sm"
-      {...props}
-    >
+    <table className="w-full border-collapse border border-slate-300 my-3 text-[9.5pt]" {...props}>
       {children}
     </table>
   ),
   th: ({ children, ...props }) => (
-    <th
-      className="border border-gray-300 px-3 py-1.5 bg-gray-100 font-semibold text-left"
-      {...props}
-    >
+    <th className="border border-slate-300 px-3 py-1.5 bg-slate-100 font-semibold text-left text-slate-700" {...props}>
       {children}
     </th>
   ),
   td: ({ children, ...props }) => (
-    <td className="border border-gray-300 px-3 py-1.5" {...props}>
+    <td className="border border-slate-300 px-3 py-1.5 text-slate-600" {...props}>
       {children}
     </td>
   ),
   hr: ({ ...props }) => (
-    <hr className="my-4 border-gray-200" {...props} />
+    <hr className="my-5 border-slate-200" {...props} />
   ),
 };
 
@@ -121,6 +110,41 @@ export default function A4PaperPreview({
     [onClose]
   );
 
+  // ── v5.3 DOCX 导出 ──
+  const [isExporting, setIsExporting] = useState(false);
+
+  const handleDownloadDocx = useCallback(async () => {
+    setIsExporting(true);
+    try {
+      const token = getToken();
+      const response = await fetch(`${API_BASE}/api/resume/export/docx`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: token ? `Bearer ${token}` : "",
+        },
+        body: JSON.stringify({ markdown_content: markdownContent }),
+      });
+      if (!response.ok) {
+        const detail = await response.json().then((d) => d.detail).catch(() => "导出失败");
+        throw new Error(typeof detail === "string" ? detail : "导出失败");
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `简历优化终稿_${new Date().toISOString().slice(0, 10)}.docx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("[DOCX导出]", err);
+    } finally {
+      setIsExporting(false);
+    }
+  }, [markdownContent]);
+
   const hasVisualPayload = visualPayload && (
     visualPayload.name ||
     visualPayload.skills.length > 0 ||
@@ -148,6 +172,13 @@ export default function A4PaperPreview({
             打印 A4 简历
           </button>
           <button
+            onClick={handleDownloadDocx}
+            disabled={isExporting}
+            className="px-4 py-2 bg-blue-600 text-white text-xs font-semibold rounded-lg hover:bg-blue-700 active:scale-[0.98] disabled:bg-slate-300 transition"
+          >
+            {isExporting ? "正在导出..." : "下载为 DOCX"}
+          </button>
+          <button
             onClick={onClose}
             className="px-4 py-1.5 text-sm rounded-lg bg-zinc-200 dark:bg-zinc-600 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-300 dark:hover:bg-zinc-500 transition-colors"
           >
@@ -169,21 +200,7 @@ export default function A4PaperPreview({
                 </div>
               )}
 
-              {/* ═══ 核心技能 Pill 标签区 ═══ */}
-              {visualPayload!.skills.length > 0 && (
-                <div className="a4-skills-section">
-                  <h2 className="a4-section-title">核心技术栈</h2>
-                  <div className="a4-skills-pills">
-                    {visualPayload!.skills.map((skill) => (
-                      <span key={skill} className="a4-skill-pill">
-                        {skill}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* ═══ 长文 Markdown 画布 ═══ */}
+              {/* ═══ 长文 Markdown 画布（含核心技术栈）═══ */}
               {visualPayload!.main_resume_markdown && (
                 <div className="a4-markdown-body">
                   <ReactMarkdown
@@ -209,7 +226,7 @@ export default function A4PaperPreview({
 
       <style jsx>{`
         /* ══════════════════════════════════════════════════════════
-           A4 纸排版强约束 —— 大厂 HR 审美级
+           A4 纸排版强约束 —— 冷色调极简工业风 v5.3
            ══════════════════════════════════════════════════════════ */
         .a4-paper {
           width: 210mm;
@@ -219,7 +236,7 @@ export default function A4PaperPreview({
           line-height: 1.6;
           font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans SC",
             "Helvetica Neue", sans-serif;
-          color: #1a1a1a;
+          color: #1e293b;
         }
 
         /* ── 结构化 Header ── */
@@ -227,7 +244,7 @@ export default function A4PaperPreview({
           text-align: center;
           margin-bottom: 24px;
           padding-bottom: 16px;
-          border-bottom: 2px solid #e5e7eb;
+          border-bottom: 2px solid #e2e8f0;
         }
 
         .a4-name {
@@ -235,47 +252,14 @@ export default function A4PaperPreview({
           font-weight: 700;
           letter-spacing: 0.05em;
           margin: 0 0 6px 0;
-          color: #111827;
+          color: #0f172a;
         }
 
         .a4-contact {
           font-size: 9pt;
-          color: #6b7280;
+          color: #64748b;
           margin: 0;
           letter-spacing: 0.02em;
-        }
-
-        /* ── 技能 Pill 标签区 ── */
-        .a4-skills-section {
-          margin-bottom: 20px;
-        }
-
-        .a4-section-title {
-          font-size: 12pt;
-          font-weight: 700;
-          color: #374151;
-          margin: 0 0 10px 0;
-          padding-bottom: 4px;
-          border-bottom: 1px solid #e5e7eb;
-        }
-
-        .a4-skills-pills {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 8px;
-        }
-
-        .a4-skill-pill {
-          display: inline-block;
-          padding: 4px 14px;
-          font-size: 9.5pt;
-          font-weight: 500;
-          color: #1e40af;
-          background: #eff6ff;
-          border: 1px solid #bfdbfe;
-          border-radius: 9999px;
-          letter-spacing: 0.01em;
-          line-height: 1.5;
         }
 
         /* ── 长文 Markdown 画布 ── */
@@ -287,25 +271,68 @@ export default function A4PaperPreview({
           margin-top: 0 !important;
         }
 
-        /* 模块间呼吸感 */
         .a4-markdown-body :global(h2) {
-          margin-top: 20px !important;
+          margin-top: 22px !important;
           margin-bottom: 10px !important;
         }
 
         .a4-markdown-body :global(h3) {
-          margin-top: 16px !important;
+          margin-top: 18px !important;
           margin-bottom: 8px !important;
         }
 
         .a4-markdown-body :global(p),
         .a4-markdown-body :global(li) {
-          margin-bottom: 4px;
+          margin-bottom: 3px;
         }
 
         .a4-markdown-body :global(ul),
         .a4-markdown-body :global(ol) {
           margin-bottom: 12px;
+        }
+
+        /* ── 微缩点阵列表 (替代系统圆点) ── */
+        :global(.a4-ul) {
+          list-style: none;
+          padding-left: 0;
+          margin: 8px 0 12px 0;
+        }
+
+        :global(.a4-ol) {
+          list-style: none;
+          padding-left: 0;
+          margin: 8px 0 12px 0;
+          counter-reset: a4-ol-counter;
+        }
+
+        :global(.a4-li) {
+          position: relative;
+          padding-left: 16px;
+          line-height: 1.7;
+          margin-bottom: 2px;
+          color: #334155;
+        }
+
+        :global(.a4-li)::before {
+          content: "•";
+          position: absolute;
+          left: 0;
+          top: 0;
+          color: #94a3b8;
+          font-size: 8pt;
+          line-height: 1.7;
+        }
+
+        :global(.a4-ol) > :global(.a4-li) {
+          padding-left: 22px;
+        }
+
+        :global(.a4-ol) > :global(.a4-li)::before {
+          content: counter(a4-ol-counter) ".";
+          counter-increment: a4-ol-counter;
+          color: #64748b;
+          font-size: 9pt;
+          font-weight: 500;
         }
 
         /* ══════════════════════════════════════════════════════════
@@ -340,9 +367,7 @@ export default function A4PaperPreview({
           button {
             display: none !important;
           }
-          .a4-skill-pill {
-            background: #eff6ff !important;
-            border: 1px solid #bfdbfe !important;
+          :global(.a4-li)::before {
             -webkit-print-color-adjust: exact;
             print-color-adjust: exact;
           }

@@ -16,8 +16,10 @@ import AgentConsole from "@/components/AgentConsole";
 import PipelinePanel from "@/components/PipelinePanel";
 import PipelineInput from "@/components/PipelineInput";
 import AgentLayout from "@/components/AgentLayout";
-import { LoginOverlay } from "@/components/LoginOverlay";
+import LoginPage from "@/components/LoginPage";
+import ModeSwitchGuard from "@/components/ModeSwitchGuard";
 import { useAuth } from "@/contexts/AuthContext";
+import { useAgentSession, useGlobalAbortController } from "@/contexts/AgentSessionContext";
 import { usePipelineStream } from "@/hooks/usePipelineStream";
 import { useAgentStream } from "@/hooks/useAgentStream";
 
@@ -26,6 +28,11 @@ type AppMode = "pipeline" | "agent";
 export default function Home() {
   const { user, token, isLoading: authLoading, logout } = useAuth();
   const [appMode, setAppMode] = useState<AppMode>("pipeline");
+  const [pendingMode, setPendingMode] = useState<AppMode | null>(null);
+
+  // ── 全局 Agent 会话状态（模式切换防呆栅栏依赖）──
+  const { isThinking: globalThinking, isStreaming: globalStreaming } = useAgentSession();
+  const { abort: globalAbort } = useGlobalAbortController();
 
   // ── Pipeline 模式顶层状态：双 Hook 并网 ──
   const {
@@ -46,6 +53,26 @@ export default function Home() {
 
   const [originalResume, setOriginalResume] = useState("");
   const [forceInputMode, setForceInputMode] = useState(false);
+
+  // ── 模式切换防呆栅栏 ──
+  const handleModeSwitch = useCallback((target: AppMode) => {
+    if (target === appMode) return;
+    if (globalThinking || globalStreaming) {
+      setPendingMode(target);
+    } else {
+      setAppMode(target);
+    }
+  }, [appMode, globalThinking, globalStreaming]);
+
+  const handleConfirmSwitch = useCallback(() => {
+    globalAbort(); // 前端拉闸 → 后端 CancelledError → checkpoint 回滚
+    setAppMode(pendingMode!);
+    setPendingMode(null);
+  }, [globalAbort, pendingMode]);
+
+  const handleCancelSwitch = useCallback(() => {
+    setPendingMode(null);
+  }, []);
 
   // 左轴条件：生成完成 + 未强制回退输入模式 → 显示 Agent 精修对话
   const showAgentChat = isGenerated && !forceInputMode;
@@ -74,11 +101,11 @@ export default function Home() {
     );
   }
 
+  // ── 未认证：显示全屏登录门面 ──
+  if (!user) return <LoginPage />;
+
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-zinc-100 dark:bg-zinc-950">
-      {/* ── v5.2 登录遮罩：未认证时覆盖全屏 ── */}
-      {!user && <LoginOverlay />}
-
       {/* ── 双模并网入口：Splash 卡片选择器 ── */}
       <div className="flex-shrink-0 bg-white dark:bg-black border-b-2 border-zinc-200 dark:border-zinc-800">
         <div className="max-w-2xl mx-auto px-6 py-4">
@@ -103,7 +130,7 @@ export default function Home() {
 
           <div className="grid grid-cols-2 gap-3">
             <button
-              onClick={() => setAppMode("pipeline")}
+              onClick={() => handleModeSwitch("pipeline")}
               className={`group relative flex flex-col items-center justify-center p-4 rounded-2xl border-2 transition-all duration-200 ${
                 appMode === "pipeline"
                   ? "border-blue-500 bg-blue-50 dark:bg-blue-950/30 shadow-lg shadow-blue-500/20"
@@ -129,7 +156,7 @@ export default function Home() {
             </button>
 
             <button
-              onClick={() => setAppMode("agent")}
+              onClick={() => handleModeSwitch("agent")}
               className={`group relative flex flex-col items-center justify-center p-4 rounded-2xl border-2 transition-all duration-200 ${
                 appMode === "agent"
                   ? "border-purple-500 bg-purple-50 dark:bg-purple-950/30 shadow-lg shadow-purple-500/20"
@@ -223,6 +250,14 @@ export default function Home() {
           <AgentLayout />
         )}
       </div>
+
+      {/* ── 模式切换防呆确认弹窗 ── */}
+      <ModeSwitchGuard
+        open={pendingMode !== null}
+        targetMode={pendingMode ?? "pipeline"}
+        onConfirm={handleConfirmSwitch}
+        onCancel={handleCancelSwitch}
+      />
     </div>
   );
 }
