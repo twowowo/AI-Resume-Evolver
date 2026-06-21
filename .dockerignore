@@ -31,8 +31,6 @@ models/
 
 # ── 测试 / 调试文件 ──
 tests/
-*.txt
-!requirements.txt
 findings.md
 progress.md
 task_plan.md
