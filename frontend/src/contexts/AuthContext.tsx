@@ -37,7 +37,7 @@ const AuthContext = createContext<AuthState | undefined>(undefined);
 
 const AUTH_STORAGE_KEY = "resume_auth_token";
 const AUTH_USER_KEY = "resume_auth_user";
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8001";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<UserInfo | null>(null);
