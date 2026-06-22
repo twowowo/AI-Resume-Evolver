@@ -21,6 +21,17 @@ import { useCallback } from "react";
 import { parseSSEStream } from "@/lib/sse-parser";
 import { streamRequest } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
+
+function uuid(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+    });
+  }
+}
 import {
   useAgentSession,
   useAgentSessionDispatch,
@@ -53,7 +64,7 @@ export function useAgentStream() {
 
     // 增量追加用户输入伪帧，保留历史多轮对话上下文
     const userLog: NodeLog = {
-      id: crypto.randomUUID(),
+      id: uuid(),
       nodeName: "user",
       msgType: "HumanMessage",
       content: userQuery,
@@ -97,7 +108,7 @@ export function useAgentStream() {
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
-                id: crypto.randomUUID(),
+                id: uuid(),
                 nodeName: nd?.node_name ?? "unknown",
                 msgType: nd?.msg_type ?? "",
                 content: nd?.content ?? "",
@@ -117,7 +128,7 @@ export function useAgentStream() {
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
-                id: crypto.randomUUID(),
+                id: uuid(),
                 nodeName: "abort_handler",
                 msgType: "SystemNotification",
                 content: (abortedData?.content as string) ?? "会话已安全中止",
@@ -132,7 +143,7 @@ export function useAgentStream() {
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
-                id: crypto.randomUUID(),
+                id: uuid(),
                 nodeName: "residual",
                 msgType: "",
                 content: typeof frame.data === "string" ? frame.data : JSON.stringify(frame.data),
@@ -159,7 +170,7 @@ export function useAgentStream() {
               dispatch({
                 type: "ADD_MESSAGE",
                 payload: {
-                  id: crypto.randomUUID(),
+                  id: uuid(),
                   nodeName: (unknownData?.node_name as string) ?? frame.event,
                   msgType: (unknownData?.msg_type as string) ?? "",
                   content: fallbackContent,

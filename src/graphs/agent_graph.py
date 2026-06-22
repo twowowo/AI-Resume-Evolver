@@ -103,15 +103,9 @@ def call_agent_brain(state: AgentState):
     # 组装当前的完整输入链
     full_messages = [system_prompt] + messages
 
-    # v4.5 双模供给器：云端 DeepSeek 主线 (timeout=120s) + 自动降级本地 gemma3:1b
-    from src.utils.llm import get_resilient_llm
-    llm = get_resilient_llm(temperature=0.3, max_tokens=8192)
-
-    # 核心动作：云端绑工具链，本地备胎纯文本模式（gemma3:1b 不支持 Function Calling）
-    if getattr(llm, "_is_fallback", False):
-        llm_with_tools = llm  # 本地备胎：禁止 bind_tools，纯文本轻装上阵
-    else:
-        llm_with_tools = llm.bind_tools(AGENT_TOOLS)
+    from src.utils.llm import get_flash_client
+    llm = get_flash_client()
+    llm_with_tools = llm.bind_tools(AGENT_TOOLS)
 
     # 触发模型推理
     print("[AgentBrain] 🧠 LLM正在思考，请稍等十来秒...")
