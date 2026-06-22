@@ -25,7 +25,7 @@ from tavily import TavilyClient
 from sqlalchemy import select
 
 # 导入物理数据库并网核心组件
-from src.database.connection import SessionLocal
+from src.database.connection import get_session
 from src.database.models import UserResume, UserProfile
 
 logging.basicConfig(level=logging.INFO)
@@ -157,7 +157,7 @@ def patch_resume_tool(section: str, new_content: str, evidence: str = "", jd_req
         )
 
     try:
-        with SessionLocal() as session:
+        with get_session() as session:
             stmt = select(UserResume).where(UserResume.user_id == user_id)
             resume = session.scalars(stmt).first()
 
@@ -233,7 +233,7 @@ def save_user_profile_tool(key: str, value: str, config: RunnableConfig = None) 
     """
     user_id = _extract_user_id(config)
     try:
-        with SessionLocal() as session:
+        with get_session() as session:
             stmt = select(UserProfile).where(
                 UserProfile.user_id == user_id,
                 UserProfile.profile_key == key,
@@ -335,7 +335,7 @@ def get_user_profile(user_id: str = "") -> dict[str, str]:
     if not user_id:
         return {}
     try:
-        with SessionLocal() as session:
+        with get_session() as session:
             stmt = select(UserProfile).where(UserProfile.user_id == user_id)
             profiles = session.scalars(stmt).all()
             return {p.profile_key: p.profile_value for p in profiles}
@@ -348,7 +348,7 @@ def clear_user_profile(user_id: str = "") -> None:
     if not user_id:
         return
     try:
-        with SessionLocal() as session:
+        with get_session() as session:
             stmt = select(UserProfile).where(UserProfile.user_id == user_id)
             profiles = session.scalars(stmt).all()
             for p in profiles:

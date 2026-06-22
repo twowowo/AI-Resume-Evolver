@@ -38,6 +38,8 @@ services:
     restart: unless-stopped
     ports:
       - "8001:8001"
+    env_file:
+      - .env
     volumes:
       - ./data:/app/data  # SqliteSaver 持久化 (resume_state.db) + 种子数据
       - ./models/huggingface:/app/models/huggingface
@@ -64,7 +66,7 @@ services:
       - CHROMA_PORT=8000
 
       # ── MySQL 持久化 ──
-      - DB_HOST=${DB_HOST:-host.docker.internal}
+      - DB_HOST=${DB_HOST:-}
       - DB_PORT=${DB_PORT:-3306}
       - DB_USER=${DB_USER:-root}
       - DB_PASSWORD=${DB_PASSWORD}

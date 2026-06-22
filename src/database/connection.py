@@ -23,7 +23,7 @@ load_dotenv(dotenv_path=_ENV_PATH)
 from sqlalchemy import create_engine, Engine
 from sqlalchemy.orm import sessionmaker, Session
 
-# ── 连接字符串构造 ──
+# ── 连接字符串构造（模块级，仅拼接 URL，不建立 TCP 连接）──
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     # fallback: 从离散参数拼接
@@ -38,22 +38,38 @@ if not DATABASE_URL:
         f"/{db_name}?charset={db_charset}"
     )
 
-# ── 同步引擎（对齐 agent_tools 同步调用链路）──
-engine: Engine = create_engine(
-    DATABASE_URL,
-    echo=os.getenv("DB_ECHO", "false").lower() == "true",
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True,          # 连接回收前 ping 检测存活
-    pool_recycle=3600,           # 1 小时强制回收
-)
+# ── 惰性引擎：首次调用 _get_engine() 或 get_session() 时才创建连接池 ──
+# 根除 import 即连 MySQL 的灾难链路：
+#   main.py → seed.py → connection.py 模块级 create_engine() → TCP 连接 host.docker.internal
+_engine: Engine | None = None
+_SessionLocal: sessionmaker[Session] | None = None
 
-# ── 会话工厂 ──
-SessionLocal: sessionmaker[Session] = sessionmaker(
-    bind=engine,
-    autocommit=False,
-    autoflush=False,
-)
+
+def _get_engine() -> Engine:
+    """惰性创建并返回 SQLAlchemy 同步引擎（首次调用时初始化连接池）。"""
+    global _engine
+    if _engine is None:
+        _engine = create_engine(
+            DATABASE_URL,
+            echo=os.getenv("DB_ECHO", "false").lower() == "true",
+            pool_size=5,
+            max_overflow=10,
+            pool_pre_ping=True,          # 连接回收前 ping 检测存活
+            pool_recycle=3600,           # 1 小时强制回收
+        )
+    return _engine
+
+
+def _get_session_local() -> sessionmaker[Session]:
+    """惰性创建并返回 SessionLocal 工厂。"""
+    global _SessionLocal
+    if _SessionLocal is None:
+        _SessionLocal = sessionmaker(
+            bind=_get_engine(),
+            autocommit=False,
+            autoflush=False,
+        )
+    return _SessionLocal
 
 
 def get_session() -> Session:
@@ -64,4 +80,4 @@ def get_session() -> Session:
         with get_session() as session:
             user = session.query(UserResume).filter_by(user_id="xxx").first()
     """
-    return SessionLocal()
+    return _get_session_local()()

@@ -23,7 +23,7 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from sqlalchemy import select
 
 from src.graphs import agent_graph as _agent_graph_module
-from src.database.connection import SessionLocal
+from src.database.connection import get_session
 from src.database.models import UserResume
 from src.utils.llm import get_flash_client
 from src.utils.checkpoint_rollback import rollback_thread_to_parent
@@ -211,7 +211,7 @@ async def stream_agent_brain(request: Request, payload: AgentPayload):
 
     # 1. 异步隔离：从 MySQL 捞出该用户的最新简历底座（线程池抽离同步阻塞）
     def _fetch_resume_sync(user_id: str):
-        with SessionLocal() as session:
+        with get_session() as session:
             stmt = select(UserResume).where(UserResume.user_id == user_id)
             return session.scalars(stmt).first()
 

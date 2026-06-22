@@ -11,7 +11,6 @@ import logging
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session as OrmSession
 
-from src.database.connection import engine, get_session
 from src.database.models import Base, User
 from src.auth.security import hash_password
 
@@ -26,8 +25,16 @@ def ensure_users_table_and_admin() -> int:
 
     返回 1 若新增了 admin 用户，否则返回 0。
     """
+    # 惰性导入：避免模块顶层 import 触发 connection.py 的引擎创建
+    from src.database.connection import _get_engine, get_session
+
     # Step 1: 物理建表（幂等，CREATE TABLE IF NOT EXISTS）
-    Base.metadata.create_all(bind=engine)
+    # MySQL 不可达时降级跳过，由 main.py 的 try/except 兜底为非致命
+    try:
+        Base.metadata.create_all(bind=_get_engine())
+    except Exception as e:
+        logger.warning(f"[AuthSeed] MySQL 不可达，跳过建表（非致命，降级为 SQLite 模式）: {e}")
+        return 0
 
     # Step 2: 检查是否有用户
     with get_session() as session:
