@@ -5,7 +5,7 @@
  * 遇到 401 时清除 token，触发重新登录。
  */
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8001";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
 const AUTH_STORAGE_KEY = "resume_auth_token";
 
 function getToken(): string | null {
