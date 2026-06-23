@@ -35,21 +35,19 @@ python main.py --server
 # Run the interactive LangGraph agent pipeline
 python run_app.py
 
-# Interactive CLI helper (wraps main.py via subprocess)
-python cli_helper.py
 ```
 
 ## Architecture
 
 There are **two parallel architectures** sharing source modules — they are independent callers, not interchangeable:
 
-### 1. Simple pipeline (used by `main.py`, `debug_run.py`, `pipelinetry.py`)
+### 1. Simple pipeline (used by `main.py`)
 
 ```
 load files → jd_analyzer_node → resume_refiner_node → export
 ```
 
-Uses `GraphState` (from `src/state.py`). Nodes are in `src/nodes/analyzer.py` and `src/nodes/refiner.py`. The analyzer extracts keywords from the JD and enriches them via hybrid RAG retrieval; the refiner rewrites the resume with those keywords and golden-case context.
+Uses `GraphState` (from `src/state.py`). Nodes include `src/nodes/pre_evaluator.py`, `src/nodes/editor.py`, `src/nodes/evaluator.py`, `src/nodes/polisher.py`, and `src/nodes/retriever.py`. The pre_evaluator scores the raw resume; the retriever fetches golden cases from ChromaDB; the editor rewrites the resume with those keywords and golden-case context; the evaluator produces final radar scores.
 
 ### 2. LangGraph agent (used by `run_app.py`)
 

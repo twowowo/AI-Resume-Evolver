@@ -5,6 +5,10 @@ Agent 模式 LangGraph 有向图 — ReAct 闭环大脑点火
     START
       │
       ▼
+  [summarize_gate] ──(messages 膨胀?)──▶ summarize_agent_history ──┐
+      │                                                             │
+      │ (未超阈值)                                                    │
+      ▼                                                             ▼
   agent_brain ──(has tool_calls?)──▶ tools_executor ──┐
       │                                                │
       │ (no tool_calls)                                │
@@ -12,6 +16,7 @@ Agent 模式 LangGraph 有向图 — ReAct 闭环大脑点火
      END ◀─────────────────────────────────────────────┘
 
 核心闭环:
+  - summarize_agent_history: 当消息历史超过阈值时，将旧消息压缩为结构化备忘录注入 System Prompt
   - call_agent_brain: 接收 System Prompt + 历史消息 + 简历底座，通过 Function Calling
     决策调用 tavily_search_tool / patch_resume_tool / save_user_profile_tool
   - tools_executor: ToolNode 自动解析 LLM 吐出的 tool_calls JSON 并执行物理代码
@@ -31,14 +36,34 @@ from langgraph.prebuilt import ToolNode
 from src.tools.agent_tools import AGENT_TOOLS
 
 
+# ═══════════════════════════════════════════════════════════════
+# v6.0 自定义消息归并器：支持上下文压缩截断
+# ═══════════════════════════════════════════════════════════════
+
+# 截断哨兵 —— 当消息列表首元素为此值时，归并器清空旧消息并仅保留后续元素
+_TRUNCATE_SENTINEL = "__AGENT_MSGS_TRUNCATE__"
+
+
+def _agent_messages_reducer(existing: list, new: list) -> list:
+    """v6.0 消息归并器：正常追加，检测到截断哨兵时全量替换旧消息。
+
+    兼容 ToolNode 和 agent_brain 的 add_messages 语义，
+    同时允许 summarize_agent_history 清空膨胀的历史。
+    """
+    if new and isinstance(new[0], SystemMessage):
+        content = getattr(new[0], "content", "")
+        if isinstance(content, str) and content == _TRUNCATE_SENTINEL:
+            return list(new[1:])
+    return add_messages(existing, new)
+
+
 # ==========================================
 # 📊 1. 定义有向图的全局状态机（AgentState）
 # ==========================================
 
 class AgentState(TypedDict):
-    # add_messages 是 LangGraph 的核心内聚算法，用于自动将新产生的
-    # Thought/Observation 追加到历史对话树中
-    messages: Annotated[List[BaseMessage], add_messages]
+    # v6.0 使用自定义归并器替代 add_messages，支持上下文压缩截断
+    messages: Annotated[List[BaseMessage], _agent_messages_reducer]
 
     # 工业级状态并网：锁定当前会话操作的原始简历底座，作为只读上下文，防止模型跑飞
     current_resume_markdown: str
@@ -48,11 +73,133 @@ class AgentState(TypedDict):
     resume_id: str             # 简历文件标识，锁定记忆沙箱边界
     step_count: int            # LangGraph 节点迭代步数累计
     total_tokens: int          # 累计消耗 Token（估算值）
+    conversation_summary: str  # v6.0 上下文压缩：历史消息的结构化备忘录
 
 
 # ==========================================
 # 🧠 2. 编写 Agent 大脑节点逻辑
 # ==========================================
+
+# ── v6.0 上下文压缩双阈值：消息数 OR 总字符数超限触发记忆脱水 ──
+SUMMARIZE_AGENT_MSG_THRESHOLD = 15     # 消息条数上限（约 5-6 轮 ReAct）
+SUMMARIZE_AGENT_CHAR_THRESHOLD = 8000  # 总字符数上限（防单条长文如 JD/简历绕过条数检测）
+KEEP_RECENT_AGENT_MSGS = 4             # 保留最近 4 条触觉记忆
+
+SUMMARIZE_AGENT_PROMPT = """你是 AI-Resume-Evolver 系统的【高保真记忆脱水引擎】。
+请阅读以下 Agent 对话历史，将其物理压缩为一段 600-800 字的【当前会话断点备忘录】。
+
+【硬核格式锁死】
+你必须严格按以下 4 个章节输出：
+
+### 1. 已完成的简历修改
+简述已完成的所有 patch_resume_tool 调用及其修改内容、模块。
+
+### 2. 当前断点与待办
+当前优化进度、下一步计划、用户最后一条指令的意图。
+
+### 3. 用户明确拒绝或推翻的修改
+用户否决过哪些建议、锁定了哪些表述禁区。
+
+### 4. 关键数据锚点
+JD 核心要求、简历关键量化指标、已搜索过的公司/技术关键词。
+
+输出纯文本，不包含代码块标记。"""
+
+
+def should_summarize_agent(state: AgentState) -> str:
+    """v6.0 上下文压缩路由：双阈值检测（消息条数 OR 总字符数超限）"""
+    msgs = state.get("messages", [])
+    msg_count = len(msgs)
+
+    total_chars = 0
+    for m in msgs:
+        content = getattr(m, "content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        if getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                args_str = str(tc.get("args", ""))
+                total_chars += len(args_str)
+
+    if msg_count > SUMMARIZE_AGENT_MSG_THRESHOLD:
+        print(f"[SummarizeGate] 消息数 {msg_count} > {SUMMARIZE_AGENT_MSG_THRESHOLD} → 触发记忆脱水")
+        return "summarize_agent_history"
+
+    if total_chars > SUMMARIZE_AGENT_CHAR_THRESHOLD:
+        print(f"[SummarizeGate] 总字符 {total_chars} > {SUMMARIZE_AGENT_CHAR_THRESHOLD} → 触发记忆脱水 (单条长文绕过检测)")
+        return "summarize_agent_history"
+
+    return "agent_brain"
+
+
+def summarize_agent_history(state: AgentState) -> dict:
+    """v6.0 高保真记忆脱水节点：将旧消息压缩为结构化备忘录
+
+    策略:
+      1. 保留最近 KEEP_RECENT_AGENT_MSGS 条触觉记忆
+      2. 其余旧消息送入 DeepSeek Flash 压缩为 600-800 字备忘录
+      3. 已有 conversation_summary 时链式合并（二次压缩）
+      4. LLM 失败时自动回退为文本截断
+
+    输出:
+      - conversation_summary: 结构化备忘录
+      - messages: 仅保留最近 4 条 + 备忘录 SystemMessage 置于头部
+    """
+    msgs: list = list(state.get("messages", []))
+
+    if len(msgs) <= KEEP_RECENT_AGENT_MSGS:
+        return {"node_status": "消息过短，跳过压缩"}
+
+    recent = msgs[-KEEP_RECENT_AGENT_MSGS:]
+    old = msgs[:-KEEP_RECENT_AGENT_MSGS]
+
+    history_parts: list[str] = []
+    for i, m in enumerate(old):
+        role = type(m).__name__
+        content = getattr(m, "content", "")
+        if isinstance(content, str) and content:
+            history_parts.append(f"[{i}][{role}]: {content[:300]}")
+        elif getattr(m, "tool_calls", None):
+            tc_names = [tc.get("name", "?") for tc in m.tool_calls]
+            history_parts.append(f"[{i}][{role} tool_calls]: {', '.join(tc_names)}")
+    history_text = "\n".join(history_parts)
+
+    existing_summary = state.get("conversation_summary", "")
+    if existing_summary:
+        full_context = (
+            f"## 上一轮压缩备忘录\n{existing_summary}\n\n"
+            f"## 本轮新增对话（需合并压缩）\n{history_text}"
+        )
+    else:
+        full_context = f"## 原始对话历史\n{history_text}"
+
+    prompt = SUMMARIZE_AGENT_PROMPT + "\n\n" + full_context
+
+    try:
+        from src.utils.llm import get_flash_client
+        llm = get_flash_client()
+        response = llm.invoke(prompt)
+        summary = response.content if hasattr(response, "content") else str(response)
+        summary = summary.strip()
+    except Exception as exc:
+        print(f"[SummarizeAgent] LLM 压缩失败: {type(exc).__name__}: {exc}, 截断回退")
+        summary = (
+            f"### 1. 已完成的简历修改\n(压缩引擎降级) 原始记录: {history_text[:300]}\n\n"
+            f"### 2. 当前断点与待办\n待恢复\n\n"
+            f"### 3. 用户明确拒绝或推翻的修改\n待恢复\n\n"
+            f"### 4. 关键数据锚点\n待恢复"
+        )
+
+    print(f"[SummarizeAgent] 压缩完成: {len(old)} 条 → {len(summary)} 字符备忘录, 保留最近 {len(recent)} 条")
+
+    return {
+        "conversation_summary": summary,
+        "messages": [
+            SystemMessage(content=_TRUNCATE_SENTINEL),
+            SystemMessage(content=summary),
+        ] + list(recent),
+    }
+
 
 def call_agent_brain(state: AgentState):
     """
@@ -122,13 +269,23 @@ def call_agent_brain(state: AgentState):
 # 初始化图对象，并注入状态声明
 workflow = StateGraph(AgentState)
 
-# 注册节点：大脑节点 + 官方的高级 ToolNode 节点
-# （自动消费并执行大模型吐出的 Function Calling JSON）
+# 注册节点：上下文压缩 + 大脑 + ToolNode
+workflow.add_node("summarize_agent_history", summarize_agent_history)
 workflow.add_node("agent_brain", call_agent_brain)
 workflow.add_node("tools_executor", ToolNode(AGENT_TOOLS))
 
-# 连线：指定 START 起点直达大脑
-workflow.add_edge(START, "agent_brain")
+# v6.0 条件入口：消息膨胀时先压缩再进大脑，否则直通
+workflow.add_conditional_edges(
+    START,
+    should_summarize_agent,
+    {
+        "summarize_agent_history": "summarize_agent_history",
+        "agent_brain": "agent_brain",
+    },
+)
+
+# 压缩完成后进入大脑
+workflow.add_edge("summarize_agent_history", "agent_brain")
 
 
 # 核心闭环路由器（Conditional Edge）：大厂级决策分流
