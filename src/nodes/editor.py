@@ -476,6 +476,90 @@ def _build_critique(original: str, revised_text: str, thinking_text: str = "",
     return "\n".join(lines)
 
 
+# ── v6.1 MySQL 物理落盘：精修简历解析为四章节持久化 ──────────────
+
+_SECTION_KEYWORDS = {
+    "basic":    ["个人", "基本信息", "教育", "联系方式", "简介", "求职", "意向", "概述", "关于"],
+    "skills":   ["技能", "技术栈", "技术", "工具", "能力"],
+    "projects": ["项目经历", "实习经历", "工作经历", "项目", "实习", "工作经验"],
+    "campus":   ["校园", "社团", "获奖", "竞赛", "活动", "志愿", "领导力", "组织"],
+}
+
+
+def _parse_markdown_sections(markdown: str) -> dict[str, str]:
+    """将 Markdown 简历按 ## 标题拆分为四个章节"""
+    result = {"basic": "", "skills": "", "projects": "", "campus": ""}
+    if not markdown or not markdown.strip():
+        return result
+
+    # 按 ## 标题切割
+    blocks: list[tuple[str, str]] = []  # [(heading, body), ...]
+    current_heading = ""
+    current_lines: list[str] = []
+
+    for line in markdown.split("\n"):
+        if line.startswith("## "):
+            if current_lines:
+                body = "\n".join(current_lines).strip()
+                blocks.append((current_heading, body))
+            current_heading = line[3:].strip()
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        body = "\n".join(current_lines).strip()
+        blocks.append((current_heading, body))
+
+    for heading, body in blocks:
+        h_lower = heading.lower().replace(" ", "")
+        assigned = False
+        for field, keywords in _SECTION_KEYWORDS.items():
+            if any(kw in h_lower for kw in keywords):
+                existing = result[field]
+                result[field] = existing + "\n\n" + body if existing else body
+                assigned = True
+                break
+        if not assigned:
+            result["basic"] = result["basic"] + "\n\n" + body if result["basic"] else body
+
+    if not any(v.strip() for v in result.values()):
+        result["basic"] = markdown
+
+    return {k: v.strip() for k, v in result.items()}
+
+
+def _persist_to_db(user_id: str, resume_md: str) -> None:
+    """将精修简历解析为四章节，upsert 到 UserResume 表。失败不抛异常。"""
+    if not user_id or not resume_md or not resume_md.strip():
+        return
+
+    sections = _parse_markdown_sections(resume_md)
+    if not any(v for v in sections.values()):
+        return
+
+    try:
+        from src.database.connection import get_session
+        from src.database.models import UserResume
+        from sqlalchemy import select
+
+        with get_session() as session:
+            stmt = select(UserResume).where(UserResume.user_id == user_id)
+            resume = session.scalars(stmt).first()
+            if not resume:
+                resume = UserResume(user_id=user_id)
+                session.add(resume)
+            for field, content in sections.items():
+                if content:
+                    setattr(resume, field, content)
+            session.commit()
+            print(f"[editor] MySQL 落盘成功: user={user_id}, "
+                  f"basic={len(sections['basic'])}c, skills={len(sections['skills'])}c, "
+                  f"projects={len(sections['projects'])}c, campus={len(sections['campus'])}c")
+    except Exception as e:
+        print(f"[editor] MySQL 落盘失败 (非致命): {type(e).__name__}: {e}")
+
+
 # ── 主节点 ──────────────────────────────────────────────────────
 
 def editor_node(state: AgentState):
@@ -551,6 +635,8 @@ def editor_node(state: AgentState):
         placeholder_count = clean_md.count("[请")
 
         print(f"[editor] 骨架模式完成, 输出 {len(clean_md)} 字符, 占位符 {placeholder_count} 处")
+
+        _persist_to_db(state.get("user_id", ""), clean_md)
 
         monologue = (
             f"[editor 防幻觉骨架模式] EXTREME_GAP，RAG 增强已注入 ({len(rag_items)} 条参考)。\n"
@@ -656,6 +742,8 @@ def editor_node(state: AgentState):
     print(f"[editor] v3.0 Markdown 优化完成: {len(clean_md)} 字符, {h2_count} 个 ## 模块, "
           f"{pipe_count} 处 | 分隔符, summary {len(optimization_summary)} 字符")
     print(f"[editor] {editor_metrics}")
+
+    _persist_to_db(state.get("user_id", ""), clean_md)
 
     return {
         "revised_resume": clean_md,

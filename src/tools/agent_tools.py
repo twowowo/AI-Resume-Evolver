@@ -362,6 +362,54 @@ def clear_user_profile(user_id: str = "") -> None:
         logger.error(f"清空长期记忆物理故障: {str(e)}")
 
 
+# ==========================================
+# 📚 武器七：金牌案例库混合检索工具 — ChromaDB RRF 融合
+# ==========================================
+
+class SearchGoldenCasesInput(BaseModel):
+    query: str = Field(
+        ...,
+        description=(
+            "针对简历优化需求的搜索查询词，用于从本地金牌案例库中检索"
+            "标杆 STAR 写法、大厂技术黑话、量化表达模板等参考材料"
+        ),
+    )
+
+
+@tool(args_schema=SearchGoldenCasesInput)
+def search_golden_cases_tool(query: str, config: RunnableConfig = None) -> str:
+    """
+    当需要参考标杆简历的写法、STAR 量化表达、大厂技术黑话、或行业最佳实践时调用。
+    从本地 ChromaDB 金牌案例库中执行向量+BM25 混合检索（RRF 融合），
+    返回最相关的参考案例。
+    """
+    try:
+        from src.utils.vector_store import hybrid_retrieve
+
+        docs = hybrid_retrieve(query, vector_k=10, bm25_k=10, fusion_k=5)
+
+        if not docs:
+            return (
+                "金牌案例库中未找到与查询强相关的参考材料。"
+                "请基于通用大厂标准继续优化，不要死等该工具。"
+            )
+
+        results: list[str] = []
+        for i, doc in enumerate(docs, 1):
+            content = doc.page_content[:500]
+            results.append(f"[案例{i}] {content}")
+
+        return "\n\n---\n\n".join(results)
+    except Exception:
+        raise ToolException(
+            "金牌案例库检索暂时不可用（向量库连接异常）。"
+            "请基于通用大厂标准继续优化，不要死等该工具。"
+        )
+
+
+search_golden_cases_tool.handle_tool_error = True
+
+
 # ── 工具清单导出（供 graph.py / run_app.py 通过 ToolNode 直接绑定）──
 AGENT_TOOLS = [
     tavily_search_tool,
@@ -370,4 +418,5 @@ AGENT_TOOLS = [
     get_current_system_time,
     probe_host_environment,
     calculate_precise_metrics,
+    search_golden_cases_tool,
 ]

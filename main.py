@@ -33,7 +33,7 @@ v3.0 更新:
 #http://127.0.0.1:8080/
 #docker compose logs -f backend
 #ssh root@47.83.25.102
-#http://47.83.25.102：8080
+#http://47.83.25.102:8080
 import json
 import os
 import sys
