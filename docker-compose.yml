@@ -44,6 +44,9 @@ services:
       - ./data:/app/data  # SqliteSaver 持久化 (resume_state.db) + 种子数据
       - ./models/huggingface:/app/models/huggingface
     environment:
+      # ── 时区 ──
+      - TZ=Asia/Shanghai
+
       # ── 服务端口 ──
       - PORT=8001
 

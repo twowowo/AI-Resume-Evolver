@@ -9,6 +9,7 @@ v6.1 15路并发锚点检索引擎 — 容器启动预热模式
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.utils.vector_store import hybrid_retrieve, cross_encoder_rerank, warmup_reranker
 from src.utils.llm import get_flash_client
 from src.state import AgentState
@@ -146,18 +147,27 @@ class RetrieverNode:
 
         jd_keywords = "\n".join(f"  {i}. {a}" for i, a in enumerate(anchors, 1))
 
-        # ── Step 2: 15路独立检索 ──
+        # ── Step 2: 15路并发检索 (ThreadPool, max_workers=6) ──
         t_retrieve_start = time.time()
         all_docs: list = []
-        for anchor in anchors:
-            docs = hybrid_retrieve(
+
+        def _retrieve_one(anchor: str) -> list:
+            return hybrid_retrieve(
                 anchor,
                 vector_k=15,
                 bm25_k=15,
                 fusion_k=8,
                 metadata_filter=metadata_filter,
             )
-            all_docs.extend(docs)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {pool.submit(_retrieve_one, a): a for a in anchors}
+            for future in as_completed(futures):
+                try:
+                    all_docs.extend(future.result())
+                except Exception as exc:
+                    anchor = futures[future]
+                    print(f"[retriever] 锚点 [{anchor[:50]}] 检索异常: {exc}")
         t_retrieve = time.time() - t_retrieve_start
 
         total_before_dedup = len(all_docs)
