@@ -257,6 +257,94 @@ def hybrid_retrieve(query: str, vector_k: int = 10, bm25_k: int = 10, fusion_k: 
     return fused_docs
 
 
+def batch_hybrid_retrieve(
+    queries: list[str],
+    vector_k: int = 15,
+    bm25_k: int = 15,
+    fusion_k: int = 8,
+    metadata_filter: dict | None = None,
+) -> list[list[Document]]:
+    """v6.2 批量混合检索：一次性编码所有查询，再逐条 RRF 融合
+
+    SentenceTransformer 在 CPU 上批处理远快于 N 次单条编码。
+    15 条锚点从 ~285s (15×19s) 降至 ~25s (1×batch_encode + 15×ChromaDB)。
+    """
+    if not queries:
+        return []
+
+    model = _get_embedding_model()
+    store = get_vector_store()
+    collection = store._collection
+
+    # ── Batch encode all queries ──
+    _BGE_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+    prefixed = [_BGE_INSTRUCTION + q for q in queries]
+    print(f"[batch_retrieve] 批量编码 {len(queries)} 条查询...")
+    all_embeddings = model._model.encode(prefixed, normalize_embeddings=True)
+
+    # ── BM25 setup ──
+    if metadata_filter:
+        bm25, bm25_texts = _build_scoped_bm25(metadata_filter)
+    else:
+        bm25 = _get_bm25()
+        bm25_texts = []
+
+    k_rrf = 60
+    all_results: list[list[Document]] = []
+
+    for qi, query in enumerate(queries):
+        embedding = all_embeddings[qi].tolist()
+
+        # Vector search
+        vec_kwargs: dict = {"n_results": vector_k}
+        if metadata_filter:
+            vec_kwargs["where"] = metadata_filter
+
+        try:
+            vec_result = collection.query(query_embeddings=[embedding], **vec_kwargs)
+        except Exception as exc:
+            print(f"[batch_retrieve] 锚点 [{query[:50]}] 向量检索异常: {exc}")
+            vec_result = None
+
+        vector_ranked: dict[str, float] = {}
+        if vec_result and vec_result.get("ids") and vec_result["ids"][0]:
+            for rank, doc_id in enumerate(vec_result["ids"][0]):
+                doc_text = vec_result["documents"][0][rank] if vec_result.get("documents") else ""
+                if doc_text:
+                    vector_ranked[doc_text] = rank + 1
+
+        # BM25
+        bm25_ranked: dict[str, float] = {}
+        if bm25 is not None:
+            query_tokens = _tokenize(query)
+            bm25_scores = bm25.get_scores(query_tokens)
+            indexed = list(enumerate(bm25_scores))
+            indexed.sort(key=lambda x: x[1], reverse=True)
+
+            if metadata_filter:
+                for rank, (idx, _score) in enumerate(indexed[:bm25_k]):
+                    if idx < len(bm25_texts):
+                        bm25_ranked[bm25_texts[idx]] = rank + 1
+            else:
+                all_texts = collection.get(include=["documents"]).get("documents", [])
+                for rank, (idx, _score) in enumerate(indexed[:bm25_k]):
+                    if idx < len(all_texts):
+                        bm25_ranked[all_texts[idx]] = rank + 1
+
+        # RRF fusion
+        rrf_scores: dict[str, float] = {}
+        for content, rank in vector_ranked.items():
+            rrf_scores[content] = rrf_scores.get(content, 0) + 1.0 / (k_rrf + rank)
+        for content, rank in bm25_ranked.items():
+            rrf_scores[content] = rrf_scores.get(content, 0) + 1.0 / (k_rrf + rank)
+
+        sorted_items = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        fused = [Document(page_content=content) for content, _ in sorted_items[:fusion_k]]
+        all_results.append(fused)
+
+    return all_results
+
+
 def get_retriever():
     global _enhanced_retriever
     if _enhanced_retriever is None:
