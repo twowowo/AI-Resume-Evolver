@@ -119,3 +119,42 @@ class UserProfile(Base):
             "user_id", "profile_key", name="uix_user_id_profile_key"
         ),
     )
+
+
+# ==========================================
+# 🔗 5. 跨管道会话桥接表模型 — 简历作战指挥室共享白板
+# ==========================================
+
+class UserSession(Base):
+    """管道B/D 跨管道上下文桥接 —— 存一份 600-800 字结构化备忘录
+
+    管道D (Agent模式) 触发 summarize_agent_history 后写入，
+    管道B (交互模式) chat_editor 启动时读取作为断点备忘录 fallback。
+    user_id + resume_id 联合唯一，同一份简历只有一条会话记录。
+    """
+    __tablename__ = "user_sessions"
+
+    id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True, comment="自增主键"
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, index=True, comment="用户全局唯一ID"
+    )
+    resume_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, comment="简历文件标识"
+    )
+    conversation_summary: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, comment="跨管道共享的结构化备忘录 (600-800字)"
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        comment="最后一次备忘录更新时间",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "resume_id", name="uix_user_session_resume"
+        ),
+    )

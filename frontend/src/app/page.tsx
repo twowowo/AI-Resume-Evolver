@@ -34,6 +34,10 @@ export default function Home() {
   const { isThinking: globalThinking, isStreaming: globalStreaming } = useAgentSession();
   const { abort: globalAbort } = useGlobalAbortController();
 
+  // ── Pipeline 模式 AgentConsole 消息过滤时间戳 ──
+  // 切换到 Pipeline 模式 / 新建优化时更新，只显示该时间点之后的消息
+  const [pipelineChatSince, setPipelineChatSince] = useState<number>(Date.now());
+
   // ── Pipeline 模式顶层状态：双 Hook 并网 ──
   const {
     state: pipelineState,
@@ -60,15 +64,23 @@ export default function Home() {
     if (globalThinking || globalStreaming) {
       setPendingMode(target);
     } else {
+      // 从 Agent 跳回 Pipeline 时，重置消息过滤时间戳，确保聊天框干净
+      if (appMode === "agent" && target === "pipeline") {
+        setPipelineChatSince(Date.now());
+      }
       setAppMode(target);
     }
   }, [appMode, globalThinking, globalStreaming]);
 
   const handleConfirmSwitch = useCallback(() => {
     globalAbort(); // 前端拉闸 → 后端 CancelledError → checkpoint 回滚
+    // 从 Agent 跳回 Pipeline 时，重置消息过滤时间戳
+    if (appMode === "agent" && pendingMode === "pipeline") {
+      setPipelineChatSince(Date.now());
+    }
     setAppMode(pendingMode!);
     setPendingMode(null);
-  }, [globalAbort, pendingMode]);
+  }, [globalAbort, pendingMode, appMode]);
 
   const handleCancelSwitch = useCallback(() => {
     setPendingMode(null);
@@ -82,6 +94,7 @@ export default function Home() {
     (resume: string, jd: string) => {
       setOriginalResume(resume);
       setForceInputMode(false);
+      setPipelineChatSince(Date.now());  // 新优化 → 聊天框重置
       startPipeline(resume, jd);
     },
     [startPipeline]
@@ -90,6 +103,7 @@ export default function Home() {
   // 从 Agent 对话模式切回输入模式（新建优化）
   const handleNewOptimize = useCallback(() => {
     setForceInputMode(true);
+    setPipelineChatSince(Date.now());  // 新优化 → 聊天框重置
   }, []);
 
   // ── 认证加载态 ──
@@ -208,7 +222,7 @@ export default function Home() {
                 /* 生成完成后 → Agent 微创精修对话 */
                 <div className="flex flex-col h-full">
                   <AgentConsole
-                    nodeLogs={agentLogs}
+                    nodeLogs={agentLogs.filter(log => log.timestamp >= pipelineChatSince)}
                     isStreaming={agentStreaming}
                     isThinking={agentThinking}
                     error={agentError}

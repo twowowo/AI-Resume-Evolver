@@ -79,6 +79,32 @@ def chat_editor_node(state: AgentState) -> dict:
     eval_feedback = state.get("evaluation_feedback") or ""
     conversation_summary = state.get("conversation_summary") or "（首次编辑，暂无历史断点）"
 
+    # ── v7.0 跨管道上下文桥接：如果自己的 checkpoint 没有备忘录，去 MySQL 读管道D 留下的 ──
+    if conversation_summary == "（首次编辑，暂无历史断点）":
+        user_id = state.get("user_id") or ""
+        resume_id = state.get("resume_id") or ""
+        if user_id and resume_id:
+            try:
+                from src.database.connection import get_session
+                from src.database.models import UserSession
+                from sqlalchemy import select
+                with get_session() as s:
+                    stmt = select(UserSession).where(
+                        UserSession.user_id == user_id,
+                        UserSession.resume_id == resume_id,
+                    )
+                    row = s.scalars(stmt).first()
+                    if row and row.conversation_summary:
+                        conversation_summary = (
+                            "【跨管道断点备忘录 —— Agent 模式遗留的会话总结】\n"
+                            + row.conversation_summary
+                        )
+                        print(f"[chat_editor] 跨管道桥接: 已加载管道D备忘录, "
+                              f"user={user_id}, resume={resume_id}, "
+                              f"{len(row.conversation_summary)} 字符")
+            except Exception as e:
+                print(f"[chat_editor] 跨管道桥接读取失败 (非致命): {e}")
+
     # ── 无任何输入 → 直接通过 ──
     if not user_input.strip() and not eval_feedback.strip():
         return {

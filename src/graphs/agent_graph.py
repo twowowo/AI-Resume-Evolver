@@ -150,8 +150,32 @@ def summarize_agent_history(state: AgentState) -> dict:
     if len(msgs) <= KEEP_RECENT_AGENT_MSGS:
         return {"node_status": "消息过短，跳过压缩"}
 
-    recent = msgs[-KEEP_RECENT_AGENT_MSGS:]
-    old = msgs[:-KEEP_RECENT_AGENT_MSGS]
+    recent = list(msgs[-KEEP_RECENT_AGENT_MSGS:])
+    old = list(msgs[:-KEEP_RECENT_AGENT_MSGS])
+
+    # ── v7.0 消息配对守卫：确保保留的第一条消息不是孤儿 ToolMessage ──
+    # 如果 recent[0] 是 ToolMessage，它需要前导的 AIMessage(tool_calls)
+    # 否则 DeepSeek API 会报 400: "tool role must follow tool_calls"
+    from langchain_core.messages import ToolMessage
+    while recent and isinstance(recent[0], ToolMessage):
+        # 从 old 末尾往回找，把配对的消息逐一移回 recent
+        needed = 1
+        for m in reversed(old):
+            needed -= 1
+            if needed <= 0 and hasattr(m, "tool_calls") and m.tool_calls:
+                # 找到了对应的 AIMessage(tool_calls)，把这一段全移回 recent
+                move_idx = old.index(m)
+                recent = old[move_idx:] + recent
+                old = old[:move_idx]
+                print(f"[SummarizeAgent] 消息配对修复: 回溯 {len(old) - move_idx} 条, "
+                      f"其中有 {sum(1 for x in recent if isinstance(x, ToolMessage))} 条 ToolMessage 被保留前置 AIMessage")
+                break
+            elif hasattr(m, "tool_calls") and m.tool_calls:
+                needed = 1  # 遇到另一个 tool_calls，重置计数
+        else:
+            # 没找到配对 → 这条 ToolMessage 真的是孤立的，直接丢弃
+            print(f"[SummarizeAgent] 消息配对修复失败: 丢弃孤儿 ToolMessage")
+            recent = recent[1:]
 
     history_parts: list[str] = []
     for i, m in enumerate(old):
@@ -249,8 +273,71 @@ def call_agent_brain(state: AgentState):
         "   随后再展示修改摘要和最终简历内容。"
     ))
 
+    # ── v7.2 消息完整性双向校验 ──
+    # DeepSeek API 双向铁律:
+    #   正向: 每条 role='tool' 前必须有 role='assistant' + tool_calls (含匹配的 tool_call_id)
+    #   反向: 每条 assistant(tool_calls) 后必须有足够数量的 tool 消息 (每 N 个 tool_call_id 匹配 N 条)
+    # 当 checkpoint 从 summarization/abort 恢复时可能出现单向或双向配对断裂
+    from langchain_core.messages import ToolMessage, AIMessage
+
+    # ── 第 1 轮: 正向扫描 → 剔除没有前置 AIMessage(tool_calls) 的孤儿 ToolMessage ──
+    validated: list = []
+    tm_dropped = 0
+    for i, msg in enumerate(messages):
+        if isinstance(msg, ToolMessage):
+            valid = False
+            # 向前回溯，跳过连续 ToolMessage，找到第一个非 ToolMessage
+            for j in range(i - 1, -1, -1):
+                prev = messages[j]
+                if isinstance(prev, ToolMessage):
+                    continue
+                if isinstance(prev, AIMessage) and getattr(prev, "tool_calls", None):
+                    valid = True
+                break
+            if valid:
+                validated.append(msg)
+            else:
+                tm_dropped += 1
+                print(f"[AgentBrain] 正向扫描: 丢弃孤儿 ToolMessage "
+                      f"(tool_call_id={getattr(msg, 'tool_call_id', '?')}): "
+                      f"{str(getattr(msg, 'content', ''))[:100]}...")
+        else:
+            validated.append(msg)
+
+    # ── 第 2 轮: 反向扫描 → 修复 tool_calls 声明但 ToolMessage 不足的 AIMessage ──
+    final: list = []
+    tc_stripped = 0
+    for i, msg in enumerate(validated):
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            expected_ids = {tc.get("id", "") for tc in msg.tool_calls}
+            expected_n = len(expected_ids)
+            # 向后统计紧随的 ToolMessage 条数 (允许中间有其他 ToolMessage)
+            actual = 0
+            for j in range(i + 1, len(validated)):
+                nxt = validated[j]
+                if isinstance(nxt, AIMessage):
+                    break  # 遇到下一个 AIMessage，当前 tool block 结束
+                if isinstance(nxt, ToolMessage):
+                    nxt_id = getattr(nxt, "tool_call_id", "")
+                    if nxt_id in expected_ids:
+                        actual += 1
+            if actual < expected_n and expected_n > 0:
+                # ToolMessage 不足 → 剥离 tool_calls，降级为普通 AIMessage
+                tc_stripped += 1
+                stripped_names = [tc.get("name", "?") for tc in msg.tool_calls]
+                print(f"[AgentBrain] 反向扫描: 剥离不完整 tool_calls (预期{expected_n}条/实有{actual}条): "
+                      f"{stripped_names}")
+                msg = AIMessage(content=getattr(msg, "content", "") or "")
+        final.append(msg)
+
+    if tm_dropped or tc_stripped:
+        print(f"[AgentBrain] 消息完整性双向校验完成: "
+              f"剔除 {tm_dropped} 条孤儿 ToolMessage + "
+              f"剥离 {tc_stripped} 条不完整 tool_calls, "
+              f"消息总数 {len(messages)} → {len(final)}")
+
     # 组装当前的完整输入链
-    full_messages = [system_prompt] + messages
+    full_messages = [system_prompt] + final
 
     from src.utils.llm import get_flash_client
     llm = get_flash_client()

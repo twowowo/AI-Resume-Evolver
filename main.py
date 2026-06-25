@@ -34,6 +34,7 @@ v3.0 更新:
 #docker compose logs -f backend
 #ssh root@47.83.25.102
 #http://47.83.25.102:8080
+
 import json
 import os
 import sys
@@ -521,7 +522,7 @@ async def optimize_resume(request: Request, payload: ResumeOptimizeRequest):
         print(f"[Security] ⚠️ 令牌不匹配拦截: payload.user_id={payload.user_id} "
               f"vs JWT={auth_user.username} — 已强制使用 JWT 身份")
     resume_id = payload.resume_id
-    thread_id = f"{user_id}::{resume_id}"
+    thread_id = f"resume::{user_id}::{resume_id}"
     print(f"[记忆沙箱点火] 线程已锁定: {thread_id}")
 
     # ── v5.5 输入保护性熔断：极短/无效输入优雅降级，杜绝 422 ──
@@ -607,9 +608,9 @@ async def _stream_chat_pipeline(thread_id: str, user_message: str):
     initial_input = {
         "user_supplement": user_message,
         "session_id": thread_id,  # 注入 session_id 以激活交互模式路由
-        # v4.2: 从复合钥匙中解包身份标识，注入状态机供 retriever 元数据过滤
-        "user_id": thread_id.split("::")[0] if "::" in thread_id else "default_user",
-        "resume_id": thread_id.split("::")[1] if "::" in thread_id else "default_resume",
+        # v4.2: 从复合钥匙中解包身份标识 (格式: resume::user_id::resume_id)
+        "user_id": thread_id.split("::")[1] if "::" in thread_id else "default_user",
+        "resume_id": thread_id.split("::")[2] if "::" in thread_id and len(thread_id.split("::")) > 2 else "default_resume",
         "step_count": 0,
         "total_tokens": 0,
     }
@@ -733,7 +734,8 @@ async def chat_resume(request: Request, payload: ChatRequest):
     # ── v5.6 JWT 强制绑定：校验 thread_id 前缀与令牌身份一致 ──
     auth_user = getattr(request.state, "user", None)
     if auth_user and "::" in (payload.thread_id or ""):
-        thread_owner = payload.thread_id.split("::")[0]
+        parts = payload.thread_id.split("::")  # 格式: resume::user_id::resume_id
+        thread_owner = parts[1] if len(parts) > 1 else ""
         if thread_owner != auth_user.username:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

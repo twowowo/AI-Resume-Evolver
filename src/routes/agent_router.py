@@ -206,7 +206,7 @@ async def stream_agent_brain(request: Request, payload: AgentPayload):
         )
 
     # ── v4.2 Layer 3: 动态复合钥匙 ──
-    thread_id = f"{user_id}::{payload.resume_id}"
+    thread_id = f"agent::{user_id}::{payload.resume_id}"
     logger.info(f"[记忆沙箱点火] 线程已锁定: {thread_id}")
 
     # 1. 异步隔离：从 MySQL 捞出该用户的最新简历底座（线程池抽离同步阻塞）
@@ -268,6 +268,11 @@ async def stream_agent_brain(request: Request, payload: AgentPayload):
                     break
 
                 for node_name, node_output in event.items():
+                    # ── v7.2 内部簿记节点不对外推送，防止历史消息二次渲染 ──
+                    if node_name == "summarize_agent_history":
+                        print(f"[AgentSSE] 跳过内部簿记节点: {node_name}")
+                        continue
+
                     # ── v4.3: 每个节点完成 → 步数累加 ──
                     step_count += 1
 
@@ -399,6 +404,42 @@ async def stream_agent_brain(request: Request, payload: AgentPayload):
                 f"[影子审计点火] 沙箱 [{thread_id}] 后台评估任务已入队，"
                 f"步数={step_count}, Token≈{estimated_tokens}"
             )
+
+            # ═══════════════════════════════════════════════════════
+            # v7.0 跨管道上下文桥接：管道D 备忘录落盘供管道B 读取
+            # ═══════════════════════════════════════════════════════
+            try:
+                from src.database.connection import get_session
+                from src.database.models import UserSession
+                from sqlalchemy import select
+
+                state_snapshot = _agent_graph_module.agent_compiled_graph.get_state(config)
+                if state_snapshot and state_snapshot.values:
+                    summary = state_snapshot.values.get("conversation_summary", "")
+                    if summary:
+                        def _persist_summary():
+                            with get_session() as s:
+                                stmt = select(UserSession).where(
+                                    UserSession.user_id == user_id,
+                                    UserSession.resume_id == payload.resume_id,
+                                )
+                                row = s.scalars(stmt).first()
+                                if not row:
+                                    row = UserSession(user_id=user_id, resume_id=payload.resume_id)
+                                    s.add(row)
+                                row.conversation_summary = summary
+                                s.commit()
+
+                        await asyncio.get_event_loop().run_in_executor(
+                            db_executor, _persist_summary
+                        )
+                        logger.info(
+                            f"[跨管道桥接] 备忘录已落盘 user_sessions: "
+                            f"user={user_id}, resume={payload.resume_id}, "
+                            f"{len(summary)} 字符"
+                        )
+            except Exception as e:
+                logger.warning(f"[跨管道桥接] 备忘录落盘失败 (非致命): {e}")
 
         except asyncio.CancelledError:
             # ═══════════════════════════════════════════════════════
