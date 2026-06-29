@@ -50,7 +50,7 @@ export interface NodeLog {
 
 export function useAgentStream() {
   const { user } = useAuth();
-  const { messages: nodeLogs, isStreaming, isThinking, error } = useAgentSession();
+  const { messages: nodeLogs, isStreaming, isThinking, error, sessionId } = useAgentSession();
   const dispatch = useAgentSessionDispatch();
   const { createController, abort } = useGlobalAbortController();
 
@@ -79,7 +79,7 @@ export function useAgentStream() {
         body: JSON.stringify({
           user_query: userQuery,
           user_id: user?.username ?? "",
-          resume_id: "default_resume",
+          thread_id: sessionId || undefined,
         }),
         signal: controller.signal,
       });
@@ -119,12 +119,20 @@ export function useAgentStream() {
             break;
           }
 
-          case "END":
+          case "END": {
+            const endData = frame.data as { summary?: string; session_id?: string };
+            if (endData?.session_id) {
+              dispatch({ type: "SET_SESSION_ID", payload: endData.session_id });
+            }
             break;
+          }
 
           case "ABORTED": {
             // 后端确认熔断 + 状态已回滚
             const abortedData = frame.data as unknown as Record<string, unknown> | undefined;
+            if (abortedData?.session_id) {
+              dispatch({ type: "SET_SESSION_ID", payload: abortedData.session_id as string });
+            }
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -196,7 +204,7 @@ export function useAgentStream() {
       dispatch({ type: "SET_THINKING", payload: false });
       dispatch({ type: "SET_STREAMING", payload: false });
     }
-  }, [createController, dispatch]);
+  }, [createController, dispatch, sessionId, user?.username]);
 
   return { nodeLogs, isStreaming, isThinking, error, startStream, abort };
 }

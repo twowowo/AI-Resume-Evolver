@@ -26,7 +26,7 @@ from sqlalchemy import select
 
 # 导入物理数据库并网核心组件
 from src.database.connection import get_session
-from src.database.models import UserResume, UserProfile
+from src.database.models import UserProfile
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AgentTools")
@@ -156,46 +156,26 @@ def patch_resume_tool(section: str, new_content: str, evidence: str = "", jd_req
             f"[Ragas 证据锚点] 章节 [{section}] JD 原文锚点: {jd_requirement[:200]}"
         )
 
-    try:
-        with get_session() as session:
-            stmt = select(UserResume).where(UserResume.user_id == user_id)
-            resume = session.scalars(stmt).first()
+    # ── v5.4 纯内存态: 简历状态由 Agent 自身 LangGraph checkpoint 持久化 ──
+    logger.info(
+        f"[MemoryPatch] 用户 [{user_id}] 的 [{section}] 章节已通过内存微创手术刀完成更新"
+    )
 
-            if not resume:
-                resume = UserResume(user_id=user_id)
-                session.add(resume)
-
-            setattr(resume, section, new_content)
-            session.commit()
-
-            logger.info(
-                f"[MySQL_UPDATE_SUCCESS] 用户 [{user_id}] "
-                f"的 [{section}] 章节物理落盘成功！"
-            )
-
-            # ── v4.6 引用式修改确认 ──
-            if evidence and jd_requirement:
-                return (
-                    f"依据 JD 中对【{jd_requirement[:120]}】的要求，"
-                    f"已在简历的【{section}】模块中进行了重构，"
-                    f"确保完全对齐该项招聘指标。\n"
-                    f"[证据链] {evidence}"
-                )
-            elif evidence:
-                return (
-                    f"【系统通知】: 简历章节 [{section}] 已通过微创手术刀完成更新。\n"
-                    f"[证据链] {evidence}"
-                )
-            else:
-                return (
-                    f"【系统通知】: 简历章节 [{section}] 已通过微创手术刀完成更新，状态：同步就位。"
-                )
-    except ToolException:
-        raise
-    except Exception:
-        raise ToolException(
-            f"物理数据库写入异常：章节 [{section}] 更新失败。"
-            f"请稍后重试或检查数据库连接状态。"
+    if evidence and jd_requirement:
+        return (
+            f"依据 JD 中对【{jd_requirement[:120]}】的要求，"
+            f"已在简历的【{section}】模块中进行了重构，"
+            f"确保完全对齐该项招聘指标。\n"
+            f"[证据链] {evidence}"
+        )
+    elif evidence:
+        return (
+            f"【系统通知】: 简历章节 [{section}] 已通过微创手术刀完成更新。\n"
+            f"[证据链] {evidence}"
+        )
+    else:
+        return (
+            f"【系统通知】: 简历章节 [{section}] 已通过微创手术刀完成更新，状态：同步就位。"
         )
 
 

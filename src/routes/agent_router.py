@@ -8,8 +8,7 @@ v4.3 后台异步影子审计：Ragas Faithfulness + Answer Relevance 零延迟�
 
 物理依赖:
   - agent_compiled_graph (src.graphs.agent_graph) — 已编译的大脑图单例
-  - SessionLocal (src.database.connection) — MySQL 同步会话工厂
-  - UserResume (src.database.models) — 简历底座物理表
+  - LangGraph checkpoint (SQLite) — Agent 独立状态持久化，不与 Pipeline 共享
 """
 
 import json
@@ -20,11 +19,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-from sqlalchemy import select
-
 from src.graphs import agent_graph as _agent_graph_module
-from src.database.connection import get_session
-from src.database.models import UserResume
 from src.utils.llm import get_flash_client
 from src.utils.checkpoint_rollback import rollback_thread_to_parent
 
@@ -57,6 +52,7 @@ class AgentPayload(BaseModel):
     user_query: str = Field(..., max_length=4000, description="用户输入的自然语言指令，最大 4000 字符")
     user_id: str = Field(default="default_user", max_length=128)
     resume_id: str = Field(default="default_resume", max_length=128)
+    thread_id: str | None = Field(default=None, max_length=128, description="续接已有会话的 thread_id，不传则生成新会话")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -157,27 +153,6 @@ async def _run_ragas_shadow_eval(
         logger.error(f"[Ragas 影子审计失败] 评估管线异常: {type(e).__name__}: {str(e)[:200]}")
 
 
-def _build_resume_base(resume_record) -> str:
-    """将 UserResume 四个章节拼装为完整 Markdown 底座，供 System Prompt 注入。"""
-    if resume_record is None:
-        return "# 原始简历底座\n## 校园经历\n- 暂无数据"
-
-    parts: list[str] = []
-    section_map = {
-        "basic": "## 个人基础信息",
-        "skills": "## 核心技术栈",
-        "projects": "## 项目经历",
-        "campus": "## 校园经历",
-    }
-    for field, heading in section_map.items():
-        content = getattr(resume_record, field, None)
-        if content and content.strip():
-            parts.append(f"{heading}\n{content.strip()}")
-
-    if not parts:
-        return "# 原始简历底座\n## 校园经历\n- 暂无数据"
-
-    return "# 原始简历底座\n\n" + "\n\n".join(parts)
 
 
 @router.post("/stream")
@@ -205,38 +180,32 @@ async def stream_agent_brain(request: Request, payload: AgentPayload):
             f"vs JWT={auth_user.username} — 已强制使用 JWT 身份"
         )
 
-    # ── v4.2 Layer 3: 动态复合钥匙 ──
-    thread_id = f"agent::{user_id}::{payload.resume_id}"
-    logger.info(f"[记忆沙箱点火] 线程已锁定: {thread_id}")
+    # ── v7.1 会话级 thread_id: 每次 Agent 对话生成全新 UUID，与 Pipeline 模块完全隔离 ──
+    import uuid as _uuid
+    resume_id = payload.resume_id if payload.resume_id and payload.resume_id != "default_resume" else f"res_{_uuid.uuid4().hex[:8]}"
+    # ── v7.1 会话续接：前端传入 thread_id 则复用，否则生成新会话 ──
+    if payload.thread_id and payload.thread_id.strip():
+        thread_id = payload.thread_id.strip()
+        logger.info(f"[记忆沙箱点火] 续接已有会话: {thread_id} (resume_id={resume_id})")
+    else:
+        thread_id = f"agent::{user_id}::{_uuid.uuid4().hex[:12]}"
+        logger.info(f"[记忆沙箱点火] 全新会话已锁定: {thread_id} (resume_id={resume_id})")
 
-    # 1. 异步隔离：从 MySQL 捞出该用户的最新简历底座（线程池抽离同步阻塞）
-    def _fetch_resume_sync(user_id: str):
-        with get_session() as session:
-            stmt = select(UserResume).where(UserResume.user_id == user_id)
-            return session.scalars(stmt).first()
+    # 1. 简历底座：Agent 独立启动，不从 Pipeline 的 MySQL 存储读取
 
-    try:
-        resume_record = await asyncio.get_event_loop().run_in_executor(
-            db_executor, _fetch_resume_sync, user_id
-        )
-        current_resume_md = _build_resume_base(resume_record)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"物理存储底座读取故障: {str(e)}")
-
-    logger.info(f"[AgentSSE] 用户 [{user_id}] 简历 [{payload.resume_id}] 发起请求, "
-                f"query={len(payload.user_query)} 字符, resume={len(current_resume_md)} 字符")
+    logger.info(f"[AgentSSE] 用户 [{user_id}] 发起请求, "
+                f"query={len(payload.user_query)} 字符")
 
     # 2. 初始化 LangGraph 状态机快照（注入沙箱身份标识 + 提效计数器）
     initial_state = {
         "messages": [HumanMessage(content=payload.user_query)],
-        "current_resume_markdown": current_resume_md,
         "user_id": user_id,
-        "resume_id": payload.resume_id,
+        "resume_id": resume_id,
         "step_count": 0,
         "total_tokens": 0,
     }
 
-    config = {"configurable": {"thread_id": thread_id, "user_id": user_id, "resume_id": payload.resume_id}}
+    config = {"configurable": {"thread_id": thread_id, "user_id": user_id, "resume_id": resume_id}}
 
     # 3. SSE 生成器 — 流式挤出节点变更日志（内嵌 v4.3 影子审计数据收集）
     async def event_generator():
@@ -379,7 +348,10 @@ async def stream_agent_brain(request: Request, payload: AgentPayload):
             # ── 流结束帧 ──
             yield ("data: " + json.dumps({
                 "event": "END",
-                "data": f"拓扑环路平滑收敛，最新数据已安全冷冻落盘 MySQL。[沙箱: {thread_id}]",
+                "data": {
+                    "summary": "拓扑环路平滑收敛",
+                    "session_id": thread_id,
+                },
             }, ensure_ascii=False) + "\n\n")
 
             # ═══════════════════════════════════════════════════════
@@ -395,7 +367,7 @@ async def stream_agent_brain(request: Request, payload: AgentPayload):
                     contexts=collected_contexts[-8:],
                     output=final_output,
                     user_id=user_id,
-                    resume_id=payload.resume_id,
+                    resume_id=resume_id,
                     step_count=step_count,
                     total_tokens=estimated_tokens,
                 )
@@ -404,42 +376,6 @@ async def stream_agent_brain(request: Request, payload: AgentPayload):
                 f"[影子审计点火] 沙箱 [{thread_id}] 后台评估任务已入队，"
                 f"步数={step_count}, Token≈{estimated_tokens}"
             )
-
-            # ═══════════════════════════════════════════════════════
-            # v7.0 跨管道上下文桥接：管道D 备忘录落盘供管道B 读取
-            # ═══════════════════════════════════════════════════════
-            try:
-                from src.database.connection import get_session
-                from src.database.models import UserSession
-                from sqlalchemy import select
-
-                state_snapshot = _agent_graph_module.agent_compiled_graph.get_state(config)
-                if state_snapshot and state_snapshot.values:
-                    summary = state_snapshot.values.get("conversation_summary", "")
-                    if summary:
-                        def _persist_summary():
-                            with get_session() as s:
-                                stmt = select(UserSession).where(
-                                    UserSession.user_id == user_id,
-                                    UserSession.resume_id == payload.resume_id,
-                                )
-                                row = s.scalars(stmt).first()
-                                if not row:
-                                    row = UserSession(user_id=user_id, resume_id=payload.resume_id)
-                                    s.add(row)
-                                row.conversation_summary = summary
-                                s.commit()
-
-                        await asyncio.get_event_loop().run_in_executor(
-                            db_executor, _persist_summary
-                        )
-                        logger.info(
-                            f"[跨管道桥接] 备忘录已落盘 user_sessions: "
-                            f"user={user_id}, resume={payload.resume_id}, "
-                            f"{len(summary)} 字符"
-                        )
-            except Exception as e:
-                logger.warning(f"[跨管道桥接] 备忘录落盘失败 (非致命): {e}")
 
         except asyncio.CancelledError:
             # ═══════════════════════════════════════════════════════
@@ -485,6 +421,7 @@ async def stream_agent_brain(request: Request, payload: AgentPayload):
                         f"本轮状态已回退到安全快照，您可以重新输入。"
                     ),
                     "thread_id": thread_id,
+                    "session_id": thread_id,
                     "rolled_back": rollback_ok,
                 },
             }, ensure_ascii=False) + "\n\n")

@@ -64,7 +64,6 @@ export function usePipelineStream() {
             jd_text: jdText,
             mode: "one_click",
             user_id: user?.username ?? "",
-            resume_id: "default_resume",
           }),
           signal: controller.signal,
         });

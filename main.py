@@ -32,8 +32,8 @@ v3.0 更新:
 #docker compose down && docker compose up -d --build
 #http://127.0.0.1:8080/
 #docker compose logs -f backend
-#ssh root@47.83.25.102
-#http://47.83.25.102:8080
+#ssh root@47.86.108.159
+#http://47.86.108.159:8080
 
 import json
 import os
@@ -163,14 +163,16 @@ async def lifespan(app: FastAPI):
     # ── v5.2 AsyncSqliteSaver 异步上下文管理器解包，生命周期 = 进程存活期 ──
     os.makedirs("data", exist_ok=True)
     async with AsyncSqliteSaver.from_conn_string("data/resume_state.db") as checkpointer:
-        # ── v5.9 WAL 模式 + 异步写入优化：彻底规避 database is locked ──
-        import aiosqlite
-        _wal_conn = await aiosqlite.connect("data/resume_state.db")
-        await _wal_conn.execute("PRAGMA journal_mode=WAL;")
-        await _wal_conn.execute("PRAGMA synchronous=NORMAL;")
-        await _wal_conn.execute("PRAGMA busy_timeout=5000;")
-        await _wal_conn.close()
-        print("[server] SQLite WAL 模式已激活 (journal_mode=WAL, synchronous=NORMAL, busy_timeout=5000ms)")
+        # ── v7.1 信任 AsyncSqliteSaver 内部的 SQLite 连接管理；
+        # WAL mode 是持久属性（设置后写回 db 文件头），无需额外 PRAGMA 连接 ──
+        try:
+            import sqlite3
+            _c = sqlite3.connect("file:data/resume_state.db?mode=ro", uri=True, timeout=2)
+            _mode = _c.execute("PRAGMA journal_mode;").fetchone()
+            _c.close()
+            print(f"[server] SQLite journal_mode={_mode[0] if _mode else 'unknown'}")
+        except Exception:
+            print("[server] SQLite journal_mode 探测跳过（AsyncSqliteSaver 内部已接管）")
 
         _app_graph = build_graph(checkpointer=checkpointer)
         print("[server] AsyncSqliteSaver 异步状态机已挂载 → data/resume_state.db")
@@ -521,9 +523,10 @@ async def optimize_resume(request: Request, payload: ResumeOptimizeRequest):
     if auth_user and payload.user_id and payload.user_id != auth_user.username:
         print(f"[Security] ⚠️ 令牌不匹配拦截: payload.user_id={payload.user_id} "
               f"vs JWT={auth_user.username} — 已强制使用 JWT 身份")
-    resume_id = payload.resume_id
-    thread_id = f"resume::{user_id}::{resume_id}"
-    print(f"[记忆沙箱点火] 线程已锁定: {thread_id}")
+    # ── v7.1 会话级 thread_id: 每次一键优化生成全新 UUID，彻底隔离不同批次的记忆 ──
+    resume_id = payload.resume_id if payload.resume_id and payload.resume_id != "default_resume" else f"res_{uuid.uuid4().hex[:8]}"
+    thread_id = f"pipeline::{user_id}::{uuid.uuid4().hex[:12]}"
+    print(f"[记忆沙箱点火] 全新会话已锁定: {thread_id} (resume_id={resume_id})")
 
     # ── v5.5 输入保护性熔断：极短/无效输入优雅降级，杜绝 422 ──
     stripped_resume = payload.resume_text.strip()
@@ -605,12 +608,10 @@ async def _stream_chat_pipeline(thread_id: str, user_message: str):
     queue: asyncio.Queue = asyncio.Queue()
     config = {"configurable": {"thread_id": thread_id}}
 
+    # ── v7.1 user_id / resume_id 不再从 thread_id 解析，改为从 checkpoint 继承 ──
     initial_input = {
         "user_supplement": user_message,
         "session_id": thread_id,  # 注入 session_id 以激活交互模式路由
-        # v4.2: 从复合钥匙中解包身份标识 (格式: resume::user_id::resume_id)
-        "user_id": thread_id.split("::")[1] if "::" in thread_id else "default_user",
-        "resume_id": thread_id.split("::")[2] if "::" in thread_id and len(thread_id.split("::")) > 2 else "default_resume",
         "step_count": 0,
         "total_tokens": 0,
     }
@@ -731,16 +732,23 @@ async def chat_resume(request: Request, payload: ChatRequest):
     | `done` | 流正常结束 | 空 JSON `{}` |
     | `error` | 异常中断 | `error`: 异常信息 |
     """
-    # ── v5.6 JWT 强制绑定：校验 thread_id 前缀与令牌身份一致 ──
+    # ── v7.1 JWT 强制绑定：从 checkpoint 读取会话归属，而非从 thread_id 字符串解析 ──
     auth_user = getattr(request.state, "user", None)
-    if auth_user and "::" in (payload.thread_id or ""):
-        parts = payload.thread_id.split("::")  # 格式: resume::user_id::resume_id
-        thread_owner = parts[1] if len(parts) > 1 else ""
-        if thread_owner != auth_user.username:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"[安全熔断] 无权访问他人会话: thread 归属 {thread_owner}, JWT 身份 {auth_user.username}",
-            )
+    if auth_user:
+        try:
+            config = {"configurable": {"thread_id": payload.thread_id}}
+            snapshot = await _app_graph.aget_state(config)
+            if snapshot and snapshot.values:
+                checkpoint_owner = (snapshot.values.get("user_id") or "").strip()
+                if checkpoint_owner and checkpoint_owner != auth_user.username:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=f"[安全熔断] 无权访问他人会话: checkpoint 归属 {checkpoint_owner}, JWT 身份 {auth_user.username}",
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # checkpoint 不存在时放行，图内部会做空状态优雅降级
 
     print(f"\n[api] 收到交互补充请求: thread_id={payload.thread_id}, "
           f"message={len(payload.user_message)} 字符")
