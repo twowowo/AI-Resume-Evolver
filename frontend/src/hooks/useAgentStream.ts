@@ -50,7 +50,7 @@ export interface NodeLog {
 
 export function useAgentStream() {
   const { user } = useAuth();
-  const { messages: nodeLogs, isStreaming, isThinking, error, sessionId } = useAgentSession();
+  const { messages: nodeLogs, isStreaming, isThinking, error, sessionId, resumeText } = useAgentSession();
   const dispatch = useAgentSessionDispatch();
   const { createController, abort } = useGlobalAbortController();
 
@@ -80,6 +80,7 @@ export function useAgentStream() {
           user_query: userQuery,
           user_id: user?.username ?? "",
           thread_id: sessionId || undefined,
+          current_resume_markdown: resumeText || "",
         }),
         signal: controller.signal,
       });
@@ -204,7 +205,7 @@ export function useAgentStream() {
       dispatch({ type: "SET_THINKING", payload: false });
       dispatch({ type: "SET_STREAMING", payload: false });
     }
-  }, [createController, dispatch, sessionId, user?.username]);
+  }, [createController, dispatch, sessionId, resumeText, user?.username]);
 
   return { nodeLogs, isStreaming, isThinking, error, startStream, abort };
 }

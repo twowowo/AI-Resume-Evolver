@@ -48,10 +48,12 @@ class AgentPayload(BaseModel):
     """v4.2 三层漏斗隔离沙箱请求体 —— user_id + resume_id 动态复合钥匙
 
     v5.9 输入防线: 全部字段强制 max_length，杜绝 100k+ 文本轰炸
+    v7.3 新增 current_resume_markdown: 前端将简历底座注入 Agent 大脑，纯 Agent 模式下可为空
     """
     user_query: str = Field(..., max_length=4000, description="用户输入的自然语言指令，最大 4000 字符")
     user_id: str = Field(default="default_user", max_length=128)
     resume_id: str = Field(default="default_resume", max_length=128)
+    current_resume_markdown: str = Field(default="", max_length=20000, description="当前简历底座 Markdown 全文，纯 Agent 模式下可为空字符串")
     thread_id: str | None = Field(default=None, max_length=128, description="续接已有会话的 thread_id，不传则生成新会话")
 
 
@@ -196,9 +198,10 @@ async def stream_agent_brain(request: Request, payload: AgentPayload):
     logger.info(f"[AgentSSE] 用户 [{user_id}] 发起请求, "
                 f"query={len(payload.user_query)} 字符")
 
-    # 2. 初始化 LangGraph 状态机快照（注入沙箱身份标识 + 提效计数器）
+    # 2. 初始化 LangGraph 状态机快照（注入沙箱身份标识 + 简历底座 + 提效计数器）
     initial_state = {
         "messages": [HumanMessage(content=payload.user_query)],
+        "current_resume_markdown": payload.current_resume_markdown,
         "user_id": user_id,
         "resume_id": resume_id,
         "step_count": 0,

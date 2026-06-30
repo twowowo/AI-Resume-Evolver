@@ -61,11 +61,12 @@ def _agent_messages_reducer(existing: list, new: list) -> list:
 # 📊 1. 定义有向图的全局状态机（AgentState）
 # ==========================================
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     # v6.0 使用自定义归并器替代 add_messages，支持上下文压缩截断
     messages: Annotated[List[BaseMessage], _agent_messages_reducer]
 
     # 工业级状态并网：锁定当前会话操作的原始简历底座，作为只读上下文，防止模型跑飞
+    # v7.3 改为可选字段：纯 Agent 模式下前端可能尚未上传简历，运行时用 .get() 安全兜底
     current_resume_markdown: str
 
     # ── v5.8 多租户隔离字段：从 agent_router 运行时注入，贯穿全链路 ──
@@ -245,7 +246,7 @@ def call_agent_brain(state: AgentState):
         "你是一个深谙大厂招聘黑话与简历 STAR 原则的顶级 AI 全栈开发智囊。\n"
         "目前你正在协助用户进行个性化的简历局部精修与求职策略推演。\n"
         "【当前操作的原始简历底座如下】:\n"
-        f"```markdown\n{state['current_resume_markdown']}\n```\n"
+        f"```markdown\n{state.get('current_resume_markdown', '') or '（用户尚未上传简历底座，等待后续交互提供）'}\n```\n"
         "【行动行为准则】:\n"
         "1. 当用户要求修改特定章节时，必须使用 `patch_resume_tool` 进行微创手术，严禁口头敷衍！\n"
         "2. 当遇到不了解的公司、行业黑话、招聘偏好时，主动调用 `tavily_search_tool` 检索，杜绝幻觉！\n"

@@ -70,6 +70,7 @@ function agentSessionReducer(
       return {
         ...state,
         messages: [],
+        sessionId: "",
         isThinking: false,
         isStreaming: false,
       };

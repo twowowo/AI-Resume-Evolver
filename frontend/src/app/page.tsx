@@ -11,7 +11,7 @@
 
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import AgentConsole from "@/components/AgentConsole";
 import PipelinePanel from "@/components/PipelinePanel";
 import PipelineInput from "@/components/PipelineInput";
@@ -19,7 +19,7 @@ import AgentLayout from "@/components/AgentLayout";
 import LoginPage from "@/components/LoginPage";
 import ModeSwitchGuard from "@/components/ModeSwitchGuard";
 import { useAuth } from "@/contexts/AuthContext";
-import { useAgentSession, useGlobalAbortController } from "@/contexts/AgentSessionContext";
+import { useAgentSession, useAgentSessionDispatch, useGlobalAbortController } from "@/contexts/AgentSessionContext";
 import { usePipelineStream } from "@/hooks/usePipelineStream";
 import { useAgentStream } from "@/hooks/useAgentStream";
 
@@ -32,6 +32,7 @@ export default function Home() {
 
   // ── 全局 Agent 会话状态（模式切换防呆栅栏依赖）──
   const { isThinking: globalThinking, isStreaming: globalStreaming } = useAgentSession();
+  const agentDispatch = useAgentSessionDispatch();
   const { abort: globalAbort } = useGlobalAbortController();
 
   // ── Pipeline 模式 AgentConsole 消息过滤时间戳 ──
@@ -58,6 +59,13 @@ export default function Home() {
   const [originalResume, setOriginalResume] = useState("");
   const [forceInputMode, setForceInputMode] = useState(false);
 
+  // ── v7.3 Pipeline 完成时将优化后简历注入 Agent 上下文，供后续交互/纯 Agent 模式使用 ──
+  useEffect(() => {
+    if (isGenerated && pipelineState.optimizedText) {
+      agentDispatch({ type: "SET_RESUME_TEXT", payload: pipelineState.optimizedText });
+    }
+  }, [isGenerated, pipelineState.optimizedText, agentDispatch]);
+
   // ── 模式切换防呆栅栏 ──
   const handleModeSwitch = useCallback((target: AppMode) => {
     if (target === appMode) return;
@@ -68,9 +76,13 @@ export default function Home() {
       if (appMode === "agent" && target === "pipeline") {
         setPipelineChatSince(Date.now());
       }
+      // 从 Pipeline 跳回 Agent 时，清空 Agent 会话避免聊天记录泄漏
+      if (appMode === "pipeline" && target === "agent") {
+        agentDispatch({ type: "RESET_SESSION" });
+      }
       setAppMode(target);
     }
-  }, [appMode, globalThinking, globalStreaming]);
+  }, [appMode, globalThinking, globalStreaming, agentDispatch]);
 
   const handleConfirmSwitch = useCallback(() => {
     globalAbort(); // 前端拉闸 → 后端 CancelledError → checkpoint 回滚
@@ -78,9 +90,13 @@ export default function Home() {
     if (appMode === "agent" && pendingMode === "pipeline") {
       setPipelineChatSince(Date.now());
     }
+    // 从 Pipeline 强制跳 Agent 时，清空 Agent 会话避免聊天记录泄漏
+    if (appMode === "pipeline" && pendingMode === "agent") {
+      agentDispatch({ type: "RESET_SESSION" });
+    }
     setAppMode(pendingMode!);
     setPendingMode(null);
-  }, [globalAbort, pendingMode, appMode]);
+  }, [globalAbort, pendingMode, appMode, agentDispatch]);
 
   const handleCancelSwitch = useCallback(() => {
     setPendingMode(null);
